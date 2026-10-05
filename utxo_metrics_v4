@@ -1,0 +1,1613 @@
+#!/usr/bin/env python3
+"""MyBot UTXO metrics v4 — read-only V50/R12.9 dense-state indicators.
+
+Internal build: utxo_metrics_v4-r5-v50-r12.9-lineage-prod.
+
+This replaces the legacy DuckDB-UTXO metrics path.  Authoritative inputs:
+  * V50 dense state: tx_records.bin, outputs.bin, closes.bin, checkpoint.bin/state.meta
+  * canonical Stage blocks parquet: height -> block_time
+  * daily BTC/USD price CSV
+  * V51.5.4 core-chain guard evidence (required by default)
+
+No AWS RAW parquet is used for canonical metrics.  No authoritative state is mutated.
+The process holds the same three shared freeze locks as the independent V51 auditor.
+
+Dense-state semantics (V50 R11/R12.9):
+  TxRecord    <32sQIIII> = txid, first_out, height, tx_index, vout_count, flags
+  OutputRecord<QqQII>    = tx_seq, value_sats, script_offset, script_len, flags
+  CloseRecord <QQII>     = output_id, closer_tx_seq, vin, type
+  close type=1: normal spend; type=2: BIP30 overwrite (not a spend/SOPR input)
+
+Metric policy changes vs v3:
+  * full history always starts at genesis; no partial-range cumsum mode;
+  * raw input coverage comes from exact type=1 CloseRecords, not AWS parquet;
+  * aSOPR removes outputs younger than 1 hour (3600 seconds), not 1 calendar day;
+  * MVRV Z-score = (market_cap - realized_cap) / expanding_std(market_cap);
+  * pre-price cost basis is explicitly 0 USD; price-dependent ratios remain NaN until valid;
+  * BIP30 overwrite removes UTXO value/cost basis/HODL inventory but is excluded from spend metrics.
+
+Outputs are atomic CSVs plus a provenance manifest in --output-dir.
+"""
+from __future__ import annotations
+
+import argparse
+import ast
+import atexit
+import base64
+import csv
+import gzip
+import fcntl
+import hashlib
+import json
+import logging
+import os
+import shutil
+import stat
+import struct
+import sys
+import time
+import tempfile
+from dataclasses import dataclass
+from datetime import date
+from pathlib import Path
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+
+import numpy as np
+import pandas as pd
+
+VERSION = "utxo_metrics_v4-r5-v50-r12.9-lineage-prod"
+METRICS_API_SCHEMA = "mybot-utxo-metrics-v4-api-1"
+LOG = logging.getLogger("mybot.utxo_metrics_v4")
+logging.basicConfig(level=os.environ.get("LOG_LEVEL", "INFO"), format="%(asctime)s %(levelname)s %(message)s")
+
+DEFAULT_STATE = Path("/opt/mybot_data/etl/utxo_v50/state")
+DEFAULT_STAGE_BASE = Path("/opt/mybot_data/etl/utxo_core_v1/stage2")
+DEFAULT_PRICE = Path("/opt/mybot_data/price_usd/btc_usd_1D.csv")
+DEFAULT_OUTPUT = Path("/root/mybot/data/onchain_v4")
+DEFAULT_WORK = Path("/opt/mybot_tmp/utxo_metrics_v4")
+DEFAULT_AUDIT_DIR = Path("/opt/mybot_data/etl/utxo_v50/audit")
+
+LEGACY_STAGE_GLOBAL_SHA256 = "3dc4e285947651d0c36bf5564c6f424d620947d29f36154ffa1cbb1dbe94860a"
+LEGACY_STAGE_END = 617698
+LEGACY_STAGE_END_HASH = "000000000000000000095ad21001856998971c4951123d14276b5f13c45e83d8"
+EXPECTED_R12_VERSION = "v50-dense-r12.9-certified-r11-supervisor-provenance-prod"
+EXPECTED_R12_SHA256 = "572f382257c797d1475a27f7e08388da120c5f88eaf00de7673608150cc8b19e"
+EXPECTED_R11_VERSION = "v50-dense-r11-buffered-script-append-singlefile-prod"
+EXPECTED_R11_SHA256 = "c735fb8cc7a63d992f0dbb4ce56cd9b4745304711d71f05b7a8db9390bc6911f"
+EXPECTED_CORE_ID = "v50-dense-core-r11-buffered-script-append"
+EXPECTED_CORE_SOURCE_SHA256 = "cb689d72992419378568d11617c8203115a7af8105adaf6dcdfbf5e972211dbf"
+EXPECTED_V5154_AUDITOR_SHA256 = "2a8b601961affd78efc90b3cc9c6042e29565a2de765d5c94edadf94f9f30d39"
+EXPECTED_V5152_AUDITOR_SHA256 = "934639d464d715dad6f77903761875e26766cd57148c6f6b2ca175b4c4b0f5a4"
+V5152_REPORT_SCHEMA = "mybot-v51-independent-audit-v1.5.2"
+APPLY_LEDGER_SCHEMA = "mybot-v50-apply-ledger-v2"
+RECOVERY_LEDGER_SCHEMA = "mybot-v50-recovery-ledger-v2"
+SOURCE_LINEAGE_SCHEMA = "mybot-v50-source-lineage-v1"
+WINDOW_FINGERPRINT_SCHEMA = "mybot-v50-r12-window-fingerprint-v2"
+PROVENANCE_EPOCH_ACTION = "PROVENANCE_EPOCH_OPEN"
+
+META = struct.Struct("<8sIIQQQQIIII32s32s32s32s")
+CHECKPOINT = struct.Struct("<8sIq32sQQQQQqQQ32s32s")
+TX_RECORD_SIZE = 56
+OUT_RECORD_SIZE = 32
+CLOSE_RECORD_SIZE = 24
+HASH_SLOT_SIZE = 40
+TX_FLAG_COINBASE = 1
+OUT_FLAG_ELIGIBLE = 1
+CLOSE_SPEND = 1
+CLOSE_BIP30 = 2
+NO_VIN = 0xFFFFFFFF
+MAX_SCRIPT_SIZE = 10_000
+V50_STATE_VERSION = 3
+MAX_MONEY_SATS = 21_000_000 * 100_000_000
+
+TX_DTYPE = np.dtype([
+    ("txid", "V32"), ("first_out", "<u8"), ("height", "<u4"),
+    ("tx_index", "<u4"), ("vout_count", "<u4"), ("flags", "<u4"),
+])
+OUT_DTYPE = np.dtype([
+    ("tx_seq", "<u8"), ("value_sats", "<i8"), ("script_offset", "<u8"),
+    ("script_len", "<u4"), ("flags", "<u4"),
+])
+CLOSE_DTYPE = np.dtype([
+    ("output_id", "<u8"), ("closer_tx_seq", "<u8"), ("vin", "<u4"), ("type", "<u4"),
+])
+
+if TX_DTYPE.itemsize != TX_RECORD_SIZE or OUT_DTYPE.itemsize != OUT_RECORD_SIZE or CLOSE_DTYPE.itemsize != CLOSE_RECORD_SIZE:
+    raise RuntimeError("NumPy dense-state dtype sizes do not match V50 physical contract")
+
+
+@dataclass(frozen=True)
+class Band:
+    name: str
+    lo_days: int
+    hi_days: Optional[int]
+
+
+HODL_BANDS = [
+    Band("0_1d", 0, 1), Band("1d_1w", 1, 7), Band("1w_1m", 7, 30),
+    Band("1m_3m", 30, 90), Band("3m_6m", 90, 180),
+    Band("6m_1y", 180, 365), Band("1y_2y", 365, 730), Band("2y_plus", 730, None),
+]
+
+
+def sha256_file(path: Path, chunk: int = 8 << 20) -> str:
+    h = hashlib.sha256()
+    with path.open("rb") as f:
+        while True:
+            b = f.read(chunk)
+            if not b:
+                break
+            h.update(b)
+    return h.hexdigest()
+
+
+def canonical_sha(obj: Any) -> str:
+    raw = json.dumps(obj, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(raw).hexdigest()
+
+
+def regular_single(path: Path) -> Path:
+    p = path.resolve(strict=True)
+    if path.is_symlink() or not p.is_file():
+        raise RuntimeError(f"required regular file invalid: {path}")
+    st = p.stat()
+    if st.st_nlink != 1:
+        raise RuntimeError(f"hardlinked authoritative file refused: {p} nlink={st.st_nlink}")
+    return p
+
+
+def file_token(path: Path) -> Dict[str, int]:
+    p = regular_single(path)
+    st = p.stat()
+    return {"dev": int(st.st_dev), "ino": int(st.st_ino), "size": int(st.st_size), "mtime_ns": int(st.st_mtime_ns), "ctime_ns": int(st.st_ctime_ns)}
+
+
+def same_token(a: Dict[str, int], b: Dict[str, int]) -> bool:
+    return all(a.get(k) == b.get(k) for k in ("dev", "ino", "size", "mtime_ns", "ctime_ns"))
+
+
+def fsync_dir(path: Path) -> None:
+    fd = os.open(str(path), os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def fsync_file(path: Path) -> None:
+    fd = os.open(str(path), os.O_RDONLY | os.O_CLOEXEC)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def atomic_json(path: Path, obj: Dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f".{path.name}.tmp.{os.getpid()}.{time.time_ns()}")
+    raw = json.dumps(obj, ensure_ascii=False, sort_keys=True, indent=2).encode("utf-8") + b"\n"
+    fd = os.open(str(tmp), os.O_CREAT | os.O_EXCL | os.O_WRONLY | os.O_CLOEXEC, 0o640)
+    try:
+        off = 0
+        while off < len(raw):
+            n = os.write(fd, raw[off:])
+            if n <= 0:
+                raise RuntimeError(f"short atomic JSON write: {tmp}")
+            off += n
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+    os.replace(tmp, path)
+    fsync_dir(path.parent)
+
+
+def write_csv_durable(path: Path, series: pd.Series) -> Dict[str, Any]:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    pd.DataFrame({"timestamp": series.index.astype(str), "value": series.to_numpy()}).to_csv(path, index=False)
+    fsync_file(path)
+    return {"sha256": sha256_file(path), "rows": int(len(series)), "size": int(path.stat().st_size)}
+
+
+def read_json(path: Path) -> Dict[str, Any]:
+    obj = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(obj, dict):
+        raise RuntimeError(f"JSON object expected: {path}")
+    return obj
+
+
+def read_sidecar(path: Path) -> str:
+    p = regular_single(path)
+    toks = p.read_text(encoding="ascii", errors="strict").strip().split()
+    if not toks or len(toks[0]) != 64:
+        raise RuntimeError(f"invalid SHA256 sidecar: {p}")
+    return toks[0].lower()
+
+
+class FreezeLease:
+    """Same shared lock order as V51 auditor: supervisor -> R11 driver -> state."""
+    def __init__(self, state: Path):
+        self.state = state.resolve(strict=True)
+        self.fds: List[Tuple[str, Path, int]] = []
+
+    def __enter__(self):
+        paths = [
+            (self.state.parent / ".v50-r12-supervisor.lock", "R12 supervisor"),
+            (self.state.parent / ".v50-driver.lock", "R11 driver"),
+            (self.state / "LOCK", "V50 state"),
+        ]
+        try:
+            for path, label in paths:
+                p = regular_single(path)
+                fd = os.open(str(p), os.O_RDONLY | os.O_CLOEXEC)
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+                except OSError as exc:
+                    os.close(fd)
+                    raise RuntimeError(f"{label} lock busy; writer/mutator active: {p}") from exc
+                self.fds.append((label, p, fd))
+        except BaseException:
+            self.__exit__(None, None, None)
+            raise
+        return self
+
+    def summary(self) -> Dict[str, Any]:
+        return {label: {"path": str(path), "shared_lock_held": True} for label, path, _ in self.fds}
+
+    def __exit__(self, *_):
+        while self.fds:
+            _, _, fd = self.fds.pop()
+            try:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+            finally:
+                os.close(fd)
+
+
+class OutputLease:
+    def __init__(self, output_dir: Path):
+        self.path = output_dir / ".utxo_metrics_v4.lock"
+        self.fd = -1
+
+    def __enter__(self):
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.fd = os.open(str(self.path), os.O_CREAT | os.O_RDWR | os.O_CLOEXEC, 0o640)
+        try:
+            fcntl.flock(self.fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as exc:
+            os.close(self.fd); self.fd = -1
+            raise RuntimeError(f"metrics output already in use: {self.path}") from exc
+        os.ftruncate(self.fd, 0)
+        os.write(self.fd, (json.dumps({"pid": os.getpid(), "version": VERSION, "created_utc": utc_now()}) + "\n").encode())
+        os.fsync(self.fd)
+        return self
+
+    def __exit__(self, *_):
+        if self.fd >= 0:
+            try:
+                fcntl.flock(self.fd, fcntl.LOCK_UN)
+            finally:
+                os.close(self.fd); self.fd = -1
+        try:
+            self.path.unlink(missing_ok=True)
+        except Exception:
+            pass
+
+
+def utc_now() -> str:
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+
+def parse_state(state: Path) -> Dict[str, Any]:
+    state = state.resolve(strict=True)
+    if (state / "dirty.bin").exists():
+        raise RuntimeError("dirty.bin present: metrics refuse recovery/mutation")
+    temp_artifacts = sorted(str(x) for x in state.glob("*.tmp.*") if x.exists())
+    if temp_artifacts:
+        raise RuntimeError(f"stale/unknown state temp artifacts present: {temp_artifacts[:20]}")
+    for n in ("state.meta", "checkpoint.bin", "tx_records.bin", "outputs.bin", "closes.bin", "scripts.bin", "LOCK"):
+        regular_single(state / n)
+    mraw = (state / "state.meta").read_bytes()
+    craw = (state / "checkpoint.bin").read_bytes()
+    if len(mraw) != META.size or len(craw) != CHECKPOINT.size:
+        raise RuntimeError("state.meta/checkpoint physical size mismatch")
+    mv = META.unpack(mraw); cv = CHECKPOINT.unpack(craw)
+    if mv[0] != b"V50META1" or mv[1] != V50_STATE_VERSION or mv[2] != 0x01020304:
+        raise RuntimeError("V50 state.meta magic/version/endian mismatch")
+    if cv[0] != b"V50CP01\x00" or cv[1] != V50_STATE_VERSION:
+        raise RuntimeError("V50 checkpoint magic/version mismatch")
+    if hashlib.sha256(mraw[:-32]).digest() != mv[-1]:
+        raise RuntimeError("state.meta checksum mismatch")
+    if hashlib.sha256(craw[:-32]).digest() != cv[-1]:
+        raise RuntimeError("checkpoint checksum mismatch")
+    txcap, outcap, closecap, hashcap = map(int, mv[3:7])
+    txsz, outsz, closesz, hashsz = map(int, mv[7:11])
+    source_sha, core_sha, driver_sha = (x.hex() for x in mv[11:14])
+    height = int(cv[2]); block_hash = cv[3].hex()
+    txc, outc, closec, script_bytes, live_count, live_value = map(int, cv[4:10])
+    cp_source = cv[12].hex()
+    if source_sha != cp_source:
+        raise RuntimeError("state.meta/checkpoint source SHA mismatch")
+    if driver_sha != EXPECTED_R11_SHA256:
+        raise RuntimeError(f"state is not bound to certified R11 driver: {driver_sha}")
+    if (txsz, outsz, closesz, hashsz) != (TX_RECORD_SIZE, OUT_RECORD_SIZE, CLOSE_RECORD_SIZE, HASH_SLOT_SIZE):
+        raise RuntimeError("V50 record-size contract mismatch")
+    if txc > txcap or outc > outcap or closec > closecap:
+        raise RuntimeError("checkpoint counters exceed capacities")
+    expected_sizes = {
+        "tx_records.bin": txcap * TX_RECORD_SIZE,
+        "outputs.bin": outcap * OUT_RECORD_SIZE,
+        "closes.bin": closecap * CLOSE_RECORD_SIZE,
+        "scripts.bin": script_bytes,
+    }
+    for n, exp in expected_sizes.items():
+        got = (state / n).stat().st_size
+        if got != exp:
+            raise RuntimeError(f"physical state size mismatch {n}: {got} != {exp}")
+    # out_count contains ALL transaction outputs.  Only OUT_FLAG_ELIGIBLE outputs
+    # participate in the live UTXO set, while every CloseRecord refers to an eligible
+    # output.  Therefore out_count-close_count is NOT the live_count contract.
+    if live_count < 0 or live_count > outc - closec:
+        raise RuntimeError(f"checkpoint live_count impossible live={live_count} out={outc} close={closec}")
+    if live_value < 0:
+        raise RuntimeError(f"checkpoint live_value_sats negative: {live_value}")
+    return {
+        "path": str(state), "height": height, "block_hash": block_hash,
+        "tx_count": txc, "out_count": outc, "close_count": closec,
+        "script_bytes": script_bytes, "live_count": live_count, "live_value_sats": live_value,
+        "source_sha256": source_sha, "core_sha256": core_sha, "driver_sha256": driver_sha,
+        "meta_sha256": hashlib.sha256(mraw).hexdigest(), "checkpoint_sha256": hashlib.sha256(craw).hexdigest(),
+        "capacities": {"tx": txcap, "out": outcap, "close": closecap, "hash": hashcap},
+    }
+
+
+def state_snapshot_tokens(state: Path) -> Dict[str, Dict[str, int]]:
+    state = state.resolve(strict=True)
+    return {str(state / n): file_token(state / n) for n in (
+        "state.meta", "checkpoint.bin", "tx_records.bin", "outputs.bin", "closes.bin", "scripts.bin"
+    )}
+
+
+def validate_state_tokens(tokens: Dict[str, Dict[str, int]]) -> None:
+    changed = [p for p, tok in tokens.items() if not same_token(tok, file_token(Path(p)))]
+    if changed:
+        raise RuntimeError(f"V50 state payload changed while metrics were running: {changed[:10]}")
+
+
+def _ledger_rows(path: Path, schema: str) -> Tuple[List[Dict[str, Any]], str]:
+    p = regular_single(path)
+    raw = p.read_bytes()
+    if raw and not raw.endswith(b"\n"):
+        raise RuntimeError(f"torn provenance JSONL tail: {p}")
+    rows: List[Dict[str, Any]] = []
+    prev = "0" * 64
+    for i, line in enumerate(raw.decode("utf-8").splitlines(), 1):
+        if not line.strip():
+            raise RuntimeError(f"blank provenance JSONL record path={p} line={i}")
+        obj = json.loads(line)
+        if not isinstance(obj, dict):
+            raise RuntimeError(f"provenance record is not object path={p} line={i}")
+        if obj.get("schema") != schema or int(obj.get("record_no") or 0) != i or str(obj.get("previous_record_sha256") or "") != prev:
+            raise RuntimeError(f"provenance chain/header invalid path={p} record={i}")
+        exp = canonical_sha({k: v for k, v in obj.items() if k != "record_sha256"})
+        if str(obj.get("record_sha256") or "") != exp:
+            raise RuntimeError(f"provenance record hash invalid path={p} record={i}")
+        prev = exp
+        rows.append(obj)
+    return rows, hashlib.sha256(raw).hexdigest()
+
+
+def _sha256_field(value: Any, label: str) -> str:
+    token = str(value or "").lower()
+    if len(token) != 64 or any(c not in "0123456789abcdef" for c in token):
+        raise RuntimeError(f"invalid SHA256 field {label}")
+    return token
+
+
+def _validate_source_lineage(
+    apply: Sequence[Dict[str, Any]],
+    recovery: Sequence[Dict[str, Any]],
+    lineage: Sequence[Dict[str, Any]],
+    state_source_sha256: str,
+    state_height: int,
+) -> Dict[str, Any]:
+    """Validate historical APPLY sources through immutable R12 source upgrades.
+
+    A source upgrade does not rewrite historical APPLY records.  Records through
+    the upgrade's committed_height remain bound to the old source; records after
+    that height must use the new source.  The lineage terminal, not every old
+    APPLY row, is what must equal state.meta/checkpoint's current source.
+    """
+    if not apply or not recovery:
+        raise RuntimeError("R12 provenance requires non-empty apply and recovery ledgers")
+
+    epoch = recovery[0]
+    epoch_source = _sha256_field(epoch.get("source_sha256"), "provenance_epoch.source_sha256")
+    current_source = _sha256_field(state_source_sha256, "state.source_sha256")
+    state_height = int(state_height)
+
+    expected_source = epoch_source
+    previous_height = -1
+    transitions: List[Dict[str, Any]] = []
+    apply_tail_heights = {int(r.get("h2", -1)) for r in apply}
+
+    for r in lineage:
+        record_no = int(r.get("record_no", -1))
+        if r.get("action") != "SOURCE_EXTENSION_COMMIT":
+            raise RuntimeError(f"unsupported source-lineage action record={record_no} action={r.get('action')}")
+        old_source = _sha256_field(r.get("old_source_sha256"), f"source_lineage[{record_no}].old_source_sha256")
+        new_source = _sha256_field(r.get("new_source_sha256"), f"source_lineage[{record_no}].new_source_sha256")
+        if old_source == new_source:
+            raise RuntimeError(f"source-lineage self-transition record={record_no}")
+        if old_source != expected_source:
+            raise RuntimeError(
+                f"source-lineage is not linear record={record_no} "
+                f"expected_old={expected_source} actual_old={old_source}"
+            )
+        try:
+            committed_height = int(r["committed_height"])
+        except Exception as exc:
+            raise RuntimeError(f"source-lineage committed_height invalid record={record_no}") from exc
+        if committed_height < 0 or committed_height > state_height or committed_height < previous_height:
+            raise RuntimeError(
+                f"source-lineage committed_height invalid record={record_no} "
+                f"previous={previous_height} current={committed_height} state={state_height}"
+            )
+        if committed_height not in apply_tail_heights:
+            raise RuntimeError(
+                f"source-lineage committed_height is not an APPLY boundary "
+                f"record={record_no} height={committed_height}"
+            )
+        if str(r.get("r11_engine_sha256") or "").lower() != EXPECTED_R11_SHA256:
+            raise RuntimeError(f"source-lineage R11 pin mismatch record={record_no}")
+        if str(r.get("supervisor_sha256") or "").lower() != EXPECTED_R12_SHA256:
+            raise RuntimeError(f"source-lineage supervisor pin mismatch record={record_no}")
+        for field in (
+            "old_source_fingerprint_sha256", "new_source_fingerprint_sha256",
+            "pre_fingerprint_sha256", "post_fingerprint_sha256", "committed_block_hash",
+        ):
+            _sha256_field(r.get(field), f"source_lineage[{record_no}].{field}")
+        if str(r.get("pre_fingerprint_sha256") or "").lower() != str(r.get("post_fingerprint_sha256") or "").lower():
+            raise RuntimeError(f"source-lineage semantic fingerprint changed record={record_no}")
+        if r.get("historical_execution_provenance_changed") is not False:
+            raise RuntimeError(f"source-lineage historical provenance changed record={record_no}")
+        prefix = r.get("prefix_equivalence")
+        if not isinstance(prefix, dict):
+            raise RuntimeError(f"source-lineage prefix proof missing record={record_no}")
+        if (
+            prefix.get("status") != "GREEN"
+            or int(prefix.get("through_height", -1)) != committed_height
+            or prefix.get("window_fingerprint_compatible") is not True
+            or prefix.get("window_fingerprint_schema") != WINDOW_FINGERPRINT_SCHEMA
+            or int(prefix.get("windows_checked", 0)) <= 0
+        ):
+            raise RuntimeError(f"source-lineage prefix proof invalid record={record_no}")
+
+        transitions.append({
+            "record_no": record_no,
+            "record_sha256": _sha256_field(r.get("record_sha256"), f"source_lineage[{record_no}].record_sha256"),
+            "old_source_sha256": old_source,
+            "new_source_sha256": new_source,
+            "committed_height": committed_height,
+        })
+        expected_source = new_source
+        previous_height = committed_height
+
+    if expected_source != current_source:
+        raise RuntimeError(
+            f"source-lineage terminal mismatch expected={expected_source} current_state_source={current_source}"
+        )
+
+    recovery_upgrades = [r for r in recovery[1:] if r.get("action") == "SOURCE_UPGRADE_COMMITTED"]
+    if len(recovery_upgrades) != len(transitions):
+        raise RuntimeError(
+            f"source-lineage/recovery upgrade count mismatch "
+            f"lineage={len(transitions)} recovery={len(recovery_upgrades)}"
+        )
+    for transition, recovered in zip(transitions, recovery_upgrades):
+        record_no = int(recovered.get("record_no", -1))
+        if (
+            str(recovered.get("old_source_sha256") or "").lower() != transition["old_source_sha256"]
+            or str(recovered.get("new_source_sha256") or "").lower() != transition["new_source_sha256"]
+            or int(recovered.get("committed_height", -1)) != transition["committed_height"]
+            or str(recovered.get("lineage_record_sha256") or "").lower() != transition["record_sha256"]
+            or recovered.get("semantic_fingerprint_unchanged") is not True
+        ):
+            raise RuntimeError(f"source upgrade recovery binding mismatch record={record_no}")
+
+    transition_index = 0
+    active_source = epoch_source
+    for r in apply:
+        record_no = int(r.get("record_no", -1))
+        h1, h2 = int(r.get("h1", -1)), int(r.get("h2", -1))
+        while transition_index < len(transitions) and transitions[transition_index]["committed_height"] < h1:
+            active_source = transitions[transition_index]["new_source_sha256"]
+            transition_index += 1
+        if (
+            transition_index < len(transitions)
+            and h1 <= transitions[transition_index]["committed_height"] < h2
+        ):
+            raise RuntimeError(
+                f"APPLY record straddles source transition record={record_no} "
+                f"transition_height={transitions[transition_index]['committed_height']} range={h1}..{h2}"
+            )
+        actual_source = _sha256_field(r.get("source_sha256"), f"apply[{record_no}].source_sha256")
+        if actual_source != active_source:
+            raise RuntimeError(
+                f"R12 apply ledger source mismatch record={record_no} "
+                f"expected={active_source} actual={actual_source}"
+            )
+
+    apply_terminal_source = _sha256_field(apply[-1].get("source_sha256"), "apply.tail.source_sha256")
+    return {
+        "status": "GREEN",
+        "epoch_source_sha256": epoch_source,
+        "terminal_source_sha256": expected_source,
+        "apply_terminal_source_sha256": apply_terminal_source,
+        "records": len(transitions),
+        "transitions": transitions,
+    }
+
+
+def validate_r12_provenance(state_path: Path, sc: Dict[str, Any]) -> Dict[str, Any]:
+    root = state_path.resolve(strict=True) / "provenance_r12"
+    if root.is_symlink() or not root.is_dir():
+        raise RuntimeError(f"R12 provenance directory missing/invalid: {root}")
+    apply_path = root / "apply_ledger_v2.jsonl"
+    recovery_path = root / "recovery_ledger_v2.jsonl"
+    lineage_path = root / "source_lineage_v1.jsonl"
+    apply, apply_sha = _ledger_rows(apply_path, APPLY_LEDGER_SCHEMA)
+    recovery, recovery_sha = _ledger_rows(recovery_path, RECOVERY_LEDGER_SCHEMA)
+    if not apply:
+        raise RuntimeError("R12 apply provenance is empty")
+    if not recovery:
+        raise RuntimeError("R12 recovery/provenance epoch ledger is empty")
+    expected_h1 = 0
+    for r in apply:
+        h1, h2 = int(r.get("h1", -1)), int(r.get("h2", -1))
+        if h1 != expected_h1 or h2 < h1:
+            raise RuntimeError(f"R12 apply ledger range discontinuity record={r.get('record_no')} expected_h1={expected_h1} got={h1}..{h2}")
+        if str(r.get("r11_engine_sha256") or "").lower() != EXPECTED_R11_SHA256:
+            raise RuntimeError(f"R12 apply ledger R11 pin mismatch record={r.get('record_no')}")
+        if str(r.get("supervisor_sha256") or "").lower() != EXPECTED_R12_SHA256:
+            raise RuntimeError(f"R12 apply ledger supervisor pin mismatch record={r.get('record_no')}")
+        expected_h1 = h2 + 1
+    if expected_h1 - 1 != int(sc["height"]):
+        raise RuntimeError(f"R12 apply ledger tail={expected_h1-1} != checkpoint height={sc['height']}")
+    tail = apply[-1]
+    final_fields = {
+        "state_block_hash": sc["block_hash"], "state_tx_count": sc["tx_count"],
+        "state_out_count": sc["out_count"], "state_close_count": sc["close_count"],
+        "state_script_bytes": sc["script_bytes"], "state_live_count": sc["live_count"],
+        "state_live_value_sats": sc["live_value_sats"],
+    }
+    for k, expected in final_fields.items():
+        if k in tail and str(tail.get(k)) != str(expected):
+            raise RuntimeError(f"R12 apply ledger terminal state mismatch field={k} ledger={tail.get(k)} checkpoint={expected}")
+    for r in recovery:
+        if "r11_engine_sha256" in r and str(r.get("r11_engine_sha256") or "").lower() != EXPECTED_R11_SHA256:
+            raise RuntimeError(f"R12 recovery ledger R11 pin mismatch record={r.get('record_no')}")
+        if "supervisor_sha256" in r and str(r.get("supervisor_sha256") or "").lower() != EXPECTED_R12_SHA256:
+            raise RuntimeError(f"R12 recovery ledger supervisor pin mismatch record={r.get('record_no')}")
+    epoch = recovery[0]
+    if epoch.get("action") != PROVENANCE_EPOCH_ACTION:
+        raise RuntimeError("R12 provenance epoch is not recovery ledger record 1")
+    if str(epoch.get("state") or "") != str(state_path.resolve()):
+        raise RuntimeError("R12 provenance epoch state path mismatch")
+    if str(epoch.get("r11_engine_sha256") or "").lower() != EXPECTED_R11_SHA256:
+        raise RuntimeError("R12 provenance epoch R11 pin mismatch")
+    if str(epoch.get("supervisor_sha256") or "").lower() != EXPECTED_R12_SHA256:
+        raise RuntimeError("R12 provenance epoch supervisor pin mismatch")
+    if lineage_path.exists():
+        lineage, lineage_sha = _ledger_rows(lineage_path, SOURCE_LINEAGE_SCHEMA)
+        lineage_file = str(lineage_path.resolve())
+        lineage_presence = "PRESENT" if lineage else "EMPTY"
+    else:
+        lineage, lineage_sha = [], None
+        lineage_file = None
+        lineage_presence = "MISSING"
+    lineage_status = _validate_source_lineage(
+        apply, recovery, lineage, str(sc["source_sha256"]), int(sc["height"])
+    )
+    lineage_status.update({
+        "presence": lineage_presence,
+        "path": lineage_file,
+        "sha256": lineage_sha,
+    })
+    return {
+        "status": "GREEN",
+        "apply": {"path": str(apply_path.resolve()), "sha256": apply_sha, "records": len(apply), "tail_height": expected_h1 - 1, "tail_record_sha256": tail["record_sha256"]},
+        "recovery": {"path": str(recovery_path.resolve()), "sha256": recovery_sha, "records": len(recovery), "epoch_origin": epoch.get("origin"), "epoch_record_sha256": epoch["record_sha256"]},
+        "source_lineage": lineage_status,
+        "stage_source_sha256": lineage_status["apply_terminal_source_sha256"],
+    }
+
+
+def _literal_assignments(source: bytes, label: str) -> Dict[str, Any]:
+    try:
+        tree = ast.parse(source.decode("utf-8"), filename=label)
+    except Exception as exc:
+        raise RuntimeError(f"cannot parse {label}: {exc}") from exc
+    out: Dict[str, Any] = {}
+    for node in tree.body:
+        if not isinstance(node, ast.Assign):
+            continue
+        try:
+            value = ast.literal_eval(node.value)
+        except Exception:
+            continue
+        for target in node.targets:
+            if isinstance(target, ast.Name):
+                out[target.id] = value
+    return out
+
+
+def validate_calculator_contract(state: Dict[str, Any], supervisor_path: Path, driver_path: Path, core_path: Path) -> Dict[str, Any]:
+    """Bind metrics to the exact production R12.9 -> embedded R11 -> dense-core lineage."""
+    supervisor = regular_single(supervisor_path)
+    driver = regular_single(driver_path)
+    core = regular_single(core_path)
+    supervisor_sha = sha256_file(supervisor)
+    driver_sha = sha256_file(driver)
+    core_sha = sha256_file(core)
+    if supervisor_sha != EXPECTED_R12_SHA256:
+        raise RuntimeError(f"production R12.9 supervisor SHA mismatch actual={supervisor_sha} expected={EXPECTED_R12_SHA256}")
+    if driver_sha != EXPECTED_R11_SHA256:
+        raise RuntimeError(f"production R11 driver SHA mismatch actual={driver_sha} expected={EXPECTED_R11_SHA256}")
+    if str(state["driver_sha256"]) != EXPECTED_R11_SHA256:
+        raise RuntimeError(f"state driver SHA mismatch actual={state['driver_sha256']} expected={EXPECTED_R11_SHA256}")
+    if str(state["core_sha256"]) != core_sha:
+        raise RuntimeError(f"state/core binary SHA mismatch state={state['core_sha256']} actual={core_sha}")
+
+    sbytes = supervisor.read_bytes()
+    sv = _literal_assignments(sbytes, str(supervisor))
+    if sv.get("VERSION") != EXPECTED_R12_VERSION or sv.get("R11_SHA256") != EXPECTED_R11_SHA256 or sv.get("R11_CORE_ID") != EXPECTED_CORE_ID:
+        raise RuntimeError("R12.9 literal production contract mismatch")
+    embedded_b64 = sv.get("R11_ENGINE_GZIP_B64")
+    if not isinstance(embedded_b64, str):
+        raise RuntimeError("R12.9 embedded R11 payload missing")
+    try:
+        embedded_r11 = gzip.decompress(base64.b64decode(embedded_b64.encode("ascii")))
+    except Exception as exc:
+        raise RuntimeError(f"R12.9 embedded R11 decode failed: {exc}") from exc
+    embedded_r11_sha = hashlib.sha256(embedded_r11).hexdigest()
+    if embedded_r11_sha != EXPECTED_R11_SHA256 or embedded_r11 != driver.read_bytes():
+        raise RuntimeError("external R11 driver is not byte-identical to R12.9 embedded certified R11")
+
+    rv = _literal_assignments(embedded_r11, "<embedded-r11>")
+    if rv.get("VERSION") != EXPECTED_R11_VERSION or rv.get("EXPECTED_CORE_ID") != EXPECTED_CORE_ID or rv.get("EMBEDDED_CORE_SOURCE_SHA256") != EXPECTED_CORE_SOURCE_SHA256:
+        raise RuntimeError("embedded R11 dense-core contract mismatch")
+    core_b64 = rv.get("EMBEDDED_CORE_GZIP_B64")
+    if not isinstance(core_b64, str):
+        raise RuntimeError("embedded R11 core source payload missing")
+    try:
+        core_source = gzip.decompress(base64.b64decode(core_b64.encode("ascii")))
+    except Exception as exc:
+        raise RuntimeError(f"embedded dense-core source decode failed: {exc}") from exc
+    core_source_sha = hashlib.sha256(core_source).hexdigest()
+    if core_source_sha != EXPECTED_CORE_SOURCE_SHA256:
+        raise RuntimeError(f"embedded dense-core source SHA mismatch actual={core_source_sha} expected={EXPECTED_CORE_SOURCE_SHA256}")
+    return {
+        "status": "GREEN",
+        "supervisor": {"path": str(supervisor), "version": EXPECTED_R12_VERSION, "sha256": supervisor_sha},
+        "r11_driver": {"path": str(driver), "version": EXPECTED_R11_VERSION, "sha256": driver_sha, "embedded_byte_identical": True},
+        "dense_core": {"path": str(core), "id": EXPECTED_CORE_ID, "binary_sha256": core_sha, "source_sha256": core_source_sha, "state_binary_binding": True},
+    }
+
+def sql_quote(s: str) -> str:
+    return "'" + s.replace("'", "''") + "'"
+
+
+def load_legacy_stage_blocks(stage_base: Path, target: int, threads: int, memory: str) -> Tuple[np.ndarray, np.ndarray, Dict[str, Any], Dict[str, Dict[str, int]]]:
+    import duckdb
+    base = stage_base.resolve(strict=True)
+    gm = regular_single(base / "manifests" / "canonical_transactions_0_617698.json")
+    side = read_sidecar(Path(str(gm) + ".sha256"))
+    if side != LEGACY_STAGE_GLOBAL_SHA256 or sha256_file(gm) != LEGACY_STAGE_GLOBAL_SHA256:
+        raise RuntimeError("legacy Stage global manifest SHA mismatch")
+    obj = read_json(gm)
+    if obj.get("schema") != "mybot_stage2_canonical_transactions_v1" or obj.get("release_complete") is not True:
+        raise RuntimeError("legacy Stage global contract mismatch")
+    if target > int(obj.get("end_height", -1)):
+        raise RuntimeError(f"Stage does not cover state target {target}")
+    w = regular_single(base / "manifests" / "canonical_transactions_0_617698.windows.tsv")
+    expected_wsha = str((obj.get("windows_tsv") or {}).get("sha256") or "").lower()
+    if read_sidecar(Path(str(w) + ".sha256")) != expected_wsha or sha256_file(w) != expected_wsha:
+        raise RuntimeError("Stage windows.tsv SHA mismatch")
+    block_paths: List[Path] = []
+    block_sidecars: List[Path] = []
+    block_shas: List[str] = []
+    nxt = 0
+    with w.open("r", encoding="ascii", newline="") as f:
+        rows = csv.DictReader(f, delimiter="\t")
+        for row in rows:
+            h1, h2 = int(row["window_start"]), int(row["window_end"])
+            if h1 != nxt or h2 < h1:
+                raise RuntimeError(f"Stage window continuity mismatch expected={nxt} got={h1}..{h2}")
+            nxt = h2 + 1
+            if h1 > target:
+                break
+            bp = regular_single(base / "windows" / f"window_{h1:06d}_{h2:06d}" / "blocks.parquet")
+            recorded = str(row["blocks_sha256"]).lower()
+            bside = regular_single(Path(str(bp) + ".sha256"))
+            if read_sidecar(bside) != recorded:
+                raise RuntimeError(f"Stage blocks sidecar mismatch: {bp}")
+            actual = sha256_file(bp)
+            if actual != recorded:
+                raise RuntimeError(f"Stage blocks payload SHA mismatch: {bp} actual={actual} expected={recorded}")
+            block_paths.append(bp); block_sidecars.append(bside); block_shas.append(recorded)
+    if not block_paths:
+        raise RuntimeError("no Stage blocks payloads selected")
+    stage_token_paths = [gm, regular_single(Path(str(gm) + ".sha256")), w, regular_single(Path(str(w) + ".sha256")), *block_paths, *block_sidecars]
+    before = {str(p): file_token(p) for p in stage_token_paths}
+    con = duckdb.connect(":memory:")
+    try:
+        con.execute(f"PRAGMA threads={max(1,int(threads))}")
+        con.execute(f"PRAGMA memory_limit={sql_quote(memory)}")
+        plist = "[" + ",".join(sql_quote(str(p)) for p in block_paths) + "]"
+        rows = con.execute(f"""
+            SELECT height::BIGINT, block_time::BIGINT
+            FROM read_parquet({plist}, union_by_name=true)
+            WHERE height BETWEEN 0 AND {int(target)}
+            ORDER BY height
+        """).fetchall()
+        if len(rows) != target + 1:
+            raise RuntimeError(f"Stage block coverage rows={len(rows)} expected={target+1}")
+        heights = np.fromiter((int(r[0]) for r in rows), dtype=np.int64, count=len(rows))
+        if not np.array_equal(heights, np.arange(target + 1, dtype=np.int64)):
+            raise RuntimeError("Stage height coverage is not exact 0..target")
+        times = np.fromiter((int(r[1]) for r in rows), dtype=np.int64, count=len(rows))
+        bh = con.execute(f"SELECT lower(block_hash::VARCHAR) FROM read_parquet({plist}, union_by_name=true) WHERE height=?", [target]).fetchall()
+        if len(bh) != 1:
+            raise RuntimeError("Stage target block hash missing/duplicated")
+        target_hash = str(bh[0][0]).lower()
+    finally:
+        con.close()
+    stage_contract = {
+        "global_manifest": str(gm), "global_sha256": LEGACY_STAGE_GLOBAL_SHA256,
+        "windows_tsv": str(w), "windows_sha256": expected_wsha,
+        "selected_block_files": len(block_paths), "target": target, "target_hash": target_hash,
+        "block_payload_set_sha256": canonical_sha([{"path": str(p), "sha256": s} for p, s in zip(block_paths, block_shas)]),
+    }
+    return times, heights, stage_contract, before
+
+
+def validate_stage_tokens(tokens: Dict[str, Dict[str, int]]) -> None:
+    changed = []
+    for p, tok in tokens.items():
+        now = file_token(Path(p))
+        if not same_token(tok, now):
+            changed.append(p)
+    if changed:
+        raise RuntimeError(f"Stage block payload changed while metrics were running: {changed[:10]}")
+
+
+def validate_state_audit_evidence(
+    explicit: Optional[Path], expected_sha256: Optional[str], state: Dict[str, Any],
+    stage: Dict[str, Any], provenance: Dict[str, Any], allow_missing: bool,
+) -> Optional[Dict[str, Any]]:
+    """Bind metrics to the immutable V51.5.2 heavy Stage->UTXO proof already completed at 617698."""
+    if explicit is None:
+        if allow_missing:
+            LOG.warning("No independent state-audit evidence supplied; diagnostic mode only")
+            return None
+        raise RuntimeError("--state-audit-report is required for production metrics")
+    p = regular_single(explicit)
+    actual_sha = sha256_file(p)
+    if not expected_sha256:
+        if allow_missing:
+            LOG.warning("State-audit evidence SHA not pinned; diagnostic mode only")
+        else:
+            raise RuntimeError("--state-audit-report-sha256 is required for production metrics")
+    elif actual_sha != str(expected_sha256).lower():
+        raise RuntimeError(f"state-audit report SHA mismatch actual={actual_sha} expected={expected_sha256}")
+    obj = read_json(p)
+    phases = obj.get("phases") or {}
+    ss = phases.get("state_scan") or {}
+    sr = phases.get("stage_rebuild") or {}
+    sem = phases.get("stage_semantics") or {}
+    cse = phases.get("core_stage_exact") or {}
+    fg = phases.get("false_green_guard") or {}
+    report_stage = obj.get("stage") or {}
+    checks = [
+        obj.get("schema") == V5152_REPORT_SCHEMA,
+        str(obj.get("auditor_sha256") or "").lower() == EXPECTED_V5152_AUDITOR_SHA256,
+        int(obj.get("target_height", -1)) == int(state["height"]),
+        str(obj.get("failed_phase") or "") == "reference_v40",
+        str((phases.get("state_contract") or {}).get("status") or "") == "OK",
+        str(ss.get("status") or "") == "OK",
+        str(sem.get("status") or "") == "OK",
+        str(cse.get("status") or "") == "OK",
+        str(sr.get("status") or "") == "OK",
+        sr.get("full_stream_hashes") is True,
+        str(fg.get("status") or "") == "OK",
+        str(report_stage.get("sha256") or "").lower() == str(stage["global_sha256"]).lower(),
+        int(ss.get("height", -1)) == int(state["height"]),
+        str(ss.get("block_hash") or "").lower() == str(state["block_hash"]).lower(),
+        str(ss.get("source_sha256") or "").lower() == str(provenance["stage_source_sha256"]).lower(),
+        int(ss.get("tx_count", -1)) == int(state["tx_count"]),
+        int(ss.get("out_count", -1)) == int(state["out_count"]),
+        int(ss.get("close_count", -1)) == int(state["close_count"]),
+        int(ss.get("script_bytes", -1)) == int(state["script_bytes"]),
+        int(ss.get("live_count", -1)) == int(state["live_count"]),
+        int(ss.get("live_value_sats", -1)) == int(state["live_value_sats"]),
+        int(sr.get("expected_close_count", -1)) == int(state["close_count"]),
+        int(sr.get("expected_live_count", -1)) == int(state["live_count"]),
+        int(sr.get("expected_live_value_sats", -1)) == int(state["live_value_sats"]),
+        int(sr.get("unresolved_prevouts", -1)) == 0,
+        int(sr.get("double_spends", -1)) == 0,
+        str(sr.get("coverage_status") or "") == "OK",
+    ]
+    if not all(checks):
+        raise RuntimeError("independent V51.5.2 state-audit evidence does not match current dense state/Stage")
+    return {
+        "status": "GREEN_HEAVY_PROOF_REUSED", "path": str(p), "sha256": actual_sha,
+        "auditor_sha256": obj.get("auditor_sha256"), "target_height": int(obj.get("target_height")),
+        "original_failed_phase": obj.get("failed_phase"),
+        "state_live_fingerprint_sha256": ss.get("live_fingerprint_sha256"),
+        "stage_expected_live_fingerprint_sha256": sr.get("expected_live_fingerprint_sha256"),
+        "tx_stream_sha256": sr.get("tx_stream_sha256"),
+        "all_outputs_sha256": sr.get("all_outputs_sha256"),
+        "close_stream_sha256": sr.get("close_stream_sha256"),
+        "full_stream_hashes": True,
+    }
+
+
+def locate_core_chain_report(audit_dir: Path, target: int, explicit: Optional[Path], expected_report_sha256: Optional[str], state: Dict[str, Any], stage: Dict[str, Any], allow_missing: bool) -> Optional[Dict[str, Any]]:
+    candidates: List[Path]
+    if explicit:
+        candidates = [explicit.resolve(strict=True)]
+    else:
+        candidates = list(audit_dir.glob(f"audit_v51_5_4_core_chain_{target}_OK_*.json"))
+        candidates.sort(key=lambda p: p.name, reverse=True)
+    errors: List[str] = []
+    for p in candidates:
+        try:
+            p = regular_single(p)
+            report_sha = sha256_file(p)
+            if expected_report_sha256 and report_sha != str(expected_report_sha256).lower():
+                raise RuntimeError(f"core-chain report SHA mismatch actual={report_sha} expected={expected_report_sha256}")
+            obj = read_json(p)
+            guard = obj.get("guard") or {}
+            st = obj.get("state") or {}
+            sg = obj.get("stage") or {}
+            checks = {
+                "schema": obj.get("schema") == "mybot-v51-core-chain-guard-v1",
+                "report_status": obj.get("status") == "OK",
+                "auditor_sha256": str(obj.get("auditor_sha256") or "").lower() == EXPECTED_V5154_AUDITOR_SHA256,
+                "state_height": int(st.get("height", -1)) == target,
+                "state_block_hash": str(st.get("block_hash") or "").lower() == str(state["block_hash"]).lower(),
+                "stage_sha256": str(sg.get("sha256") or "").lower() == str(stage["global_sha256"]).lower(),
+                "guard_status": guard.get("status") == "OK",
+                "heights_checked": int(guard.get("heights_checked", -1)) == target + 1,
+                "mismatch_count": int(guard.get("mismatch_count", -1)) == 0,
+                "end_anchor_stable": guard.get("end_anchor_stable") is True,
+                "stage_payload_stable": guard.get("stage_payload_stable") is True,
+                "chain_digest": str(guard.get("expected_chain_digest_sha256") or "") == str(guard.get("observed_chain_digest_sha256") or ""),
+                "stage_end_hash": str(guard.get("stage_end_hash") or "").lower() == str(state["block_hash"]).lower(),
+            }
+            failed_checks = [name for name, ok in checks.items() if not ok]
+            if failed_checks:
+                raise RuntimeError("core-chain report contract does not match current state/stage: " + ",".join(failed_checks))
+            return {
+                "path": str(p), "sha256": report_sha, "created_utc": obj.get("created_utc"),
+                "auditor_sha256": obj.get("auditor_sha256"),
+                "chain_digest_sha256": guard.get("expected_chain_digest_sha256"),
+                "heights_checked": int(guard.get("heights_checked")),
+            }
+        except Exception as exc:
+            errors.append(f"{p}: {type(exc).__name__}: {exc}")
+    if allow_missing:
+        LOG.warning("No valid V51.5.4 core-chain report; continuing only because --allow-no-core-chain-report was set")
+        return None
+    raise RuntimeError("no valid V51.5.4 core-chain guard evidence for current state: " + " | ".join(errors[:5]))
+
+
+def infer_ts_unit(s: pd.Series) -> str:
+    vals = pd.to_numeric(s, errors="coerce").dropna()
+    if vals.empty: return "ms"
+    med = float(vals.abs().median())
+    if med > 1e17: return "ns"
+    if med > 1e14: return "us"
+    if med > 1e11: return "ms"
+    return "s"
+
+
+def read_price(path: Path) -> pd.DataFrame:
+    path = regular_single(path)
+    df = pd.read_csv(path)
+    if df.empty:
+        raise RuntimeError("price CSV is empty")
+    cols = {str(c).strip().lower(): c for c in df.columns}
+    tc = cols.get("ts") or cols.get("timestamp") or cols.get("time") or cols.get("date")
+    pc = cols.get("c") or cols.get("close") or cols.get("price") or cols.get("value")
+    if tc is None or pc is None:
+        raise RuntimeError(f"unrecognized price CSV columns: {list(df.columns)}")
+    raw = df[tc]
+    if pd.api.types.is_numeric_dtype(raw):
+        dt = pd.to_datetime(raw, unit=infer_ts_unit(raw), utc=True, errors="coerce")
+    else:
+        dt = pd.to_datetime(raw, utc=True, errors="coerce")
+    px = pd.to_numeric(df[pc], errors="coerce")
+    out = pd.DataFrame({"date": dt.dt.date, "price": px}).dropna()
+    out = out[out["price"] > 0].groupby("date", as_index=False).agg(price=("price", "last")).sort_values("date")
+    if out.empty:
+        raise RuntimeError("price CSV has no positive valid rows")
+    return out
+
+
+def add_at_int(dest: np.ndarray, keys: np.ndarray, values: np.ndarray) -> None:
+    np.add.at(dest, keys.astype(np.intp, copy=False), values.astype(np.int64, copy=False))
+
+
+def add_at_float(dest: np.ndarray, keys: np.ndarray, values: np.ndarray) -> None:
+    np.add.at(dest, keys.astype(np.intp, copy=False), values.astype(np.float64, copy=False))
+
+
+def compute_hodl(created_sats: np.ndarray, closure_matrix: np.ndarray, dates: pd.Index) -> Dict[str, pd.Series]:
+    n = len(created_sats)
+    live = np.zeros(n, dtype=np.int64)
+    out = {b.name: np.full(n, np.nan, dtype=np.float64) for b in HODL_BANDS}
+    for d in range(n):
+        live[d] += int(created_sats[d])
+        live -= closure_matrix[d]
+        if np.any(live < 0):
+            bad = int(np.where(live < 0)[0][0])
+            raise RuntimeError(f"HODL cohort became negative day={d} created_day={bad} value={int(live[bad])}")
+        total = int(live.sum(dtype=np.int64))
+        if total <= 0:
+            continue
+        for b in HODL_BANDS:
+            hi_created = d - b.lo_days
+            if hi_created < 0:
+                val = 0
+            else:
+                lo_created = 0 if b.hi_days is None else max(0, d - b.hi_days + 1)
+                if lo_created > hi_created:
+                    val = 0
+                else:
+                    val = int(live[lo_created:hi_created+1].sum(dtype=np.int64))
+            out[b.name][d] = val / total
+    return {k: pd.Series(v, index=dates, dtype="float64") for k, v in out.items()}
+
+
+def safe_div(a: np.ndarray, b: np.ndarray) -> np.ndarray:
+    a = np.asarray(a, dtype=np.float64); b = np.asarray(b, dtype=np.float64)
+    out = np.full_like(a, np.nan, dtype=np.float64)
+    np.divide(a, b, out=out, where=np.isfinite(b) & (b != 0))
+    out[~np.isfinite(out)] = np.nan
+    return out
+
+
+def validate_tx_records(tx: np.memmap, sc: Dict[str, Any], chunk: int = 2_000_000) -> Dict[str, Any]:
+    """Linear restatement of the dense-core transaction/frontier contract used by metrics."""
+    expected_first_out = 0
+    prev_h = -1
+    prev_i = -1
+    n = int(sc["tx_count"])
+    step = max(100_000, int(chunk))
+    for s in range(0, n, step):
+        e = min(n, s + step)
+        r = tx[s:e]
+        h = np.asarray(r["height"], dtype=np.int64)
+        ti = np.asarray(r["tx_index"], dtype=np.int64)
+        vc = np.asarray(r["vout_count"], dtype=np.uint64)
+        first = np.asarray(r["first_out"], dtype=np.uint64)
+        flags = np.asarray(r["flags"], dtype=np.uint32)
+        if np.any(vc == 0):
+            raise RuntimeError(f"TxRecord zero vout_count in {s}..{e}")
+        if np.any((flags != 0) & (flags != TX_FLAG_COINBASE)):
+            raise RuntimeError(f"TxRecord flags invalid in {s}..{e}")
+        if len(h) and (int(h.min()) < 0 or int(h.max()) > int(sc["height"])):
+            raise RuntimeError(f"TxRecord height out of range in {s}..{e}")
+        if np.any(((flags & TX_FLAG_COINBASE) != 0) != (ti == 0)):
+            raise RuntimeError(f"TxRecord coinbase/tx_index contract mismatch in {s}..{e}")
+        prefix = np.cumsum(vc, dtype=np.uint64)
+        expected = np.uint64(expected_first_out) + prefix - vc
+        if not np.array_equal(first, expected):
+            bad = int(np.flatnonzero(first != expected)[0])
+            raise RuntimeError(f"TxRecord first_out frontier mismatch tx_seq={s+bad}")
+        if len(h):
+            if s == 0:
+                if int(h[0]) != 0 or int(ti[0]) != 0 or int(first[0]) != 0:
+                    raise RuntimeError("TxRecord genesis frontier mismatch")
+            else:
+                dh0 = int(h[0]) - prev_h
+                if not ((dh0 == 0 and int(ti[0]) == prev_i + 1) or (dh0 == 1 and int(ti[0]) == 0)):
+                    raise RuntimeError(f"TxRecord order discontinuity at tx_seq={s}")
+            if len(h) > 1:
+                dh = h[1:] - h[:-1]
+                same_ok = (dh == 0) & (ti[1:] == ti[:-1] + 1)
+                next_ok = (dh == 1) & (ti[1:] == 0)
+                ok = same_ok | next_ok
+                if not np.all(ok):
+                    bad = int(np.flatnonzero(~ok)[0]) + 1
+                    raise RuntimeError(f"TxRecord order discontinuity at tx_seq={s+bad}")
+            prev_h = int(h[-1]); prev_i = int(ti[-1])
+            expected_first_out += int(prefix[-1])
+        if s == 0 or e == n or (s // step) % 25 == 0:
+            LOG.info("tx_records validated=%s/%s", f"{e:,}", f"{n:,}")
+    if prev_h != int(sc["height"]):
+        raise RuntimeError(f"TxRecord terminal height={prev_h} != checkpoint={sc['height']}")
+    if expected_first_out != int(sc["out_count"]):
+        raise RuntimeError(f"TxRecord output frontier={expected_first_out} != checkpoint out_count={sc['out_count']}")
+    return {"status": "GREEN", "tx_count": n, "out_frontier": expected_first_out, "terminal_height": prev_h}
+
+
+def build_metrics(args: argparse.Namespace) -> Dict[str, Any]:
+    state_path = Path(args.state)
+    output_dir = Path(args.output_dir)
+    work_dir = Path(args.work_dir)
+    work_dir.mkdir(parents=True, exist_ok=True)
+    started = time.monotonic()
+
+    with FreezeLease(state_path) as freeze, OutputLease(output_dir):
+        sc = parse_state(state_path)
+        state_tokens = state_snapshot_tokens(state_path)
+        calculator = validate_calculator_contract(sc, Path(args.supervisor), Path(args.driver), Path(args.core))
+        provenance = validate_r12_provenance(state_path, sc)
+        target = int(sc["height"])
+        if args.expected_height is not None and target != int(args.expected_height):
+            raise RuntimeError(f"state height={target} != expected-height={args.expected_height}")
+        LOG.info("V50 snapshot height=%s tx=%s out=%s close=%s live=%s value=%s", target, sc["tx_count"], sc["out_count"], sc["close_count"], sc["live_count"], sc["live_value_sats"])
+
+        times, heights, stage, stage_tokens = load_legacy_stage_blocks(Path(args.stage_base), target, args.threads, args.memory_limit)
+        if stage["target_hash"] != sc["block_hash"]:
+            raise RuntimeError(f"Stage/state target hash mismatch {stage['target_hash']} != {sc['block_hash']}")
+        if str(stage["global_sha256"]).lower() != str(provenance["stage_source_sha256"]).lower():
+            raise RuntimeError(
+                f"Stage/APPLY source mismatch stage={stage['global_sha256']} "
+                f"apply_terminal={provenance['stage_source_sha256']} current_state={sc['source_sha256']}"
+            )
+        state_audit = validate_state_audit_evidence(
+            Path(args.state_audit_report) if args.state_audit_report else None, args.state_audit_report_sha256,
+            sc, stage, provenance, args.allow_no_state_audit_report,
+        )
+        guard = locate_core_chain_report(Path(args.audit_dir), target, Path(args.core_chain_report) if args.core_chain_report else None, args.core_chain_report_sha256, sc, stage, args.allow_no_core_chain_report)
+
+        price_path = Path(args.price)
+        price_df = read_price(price_path)
+        price_sha = sha256_file(price_path)
+
+        epoch_days = np.floor_divide(times, 86400).astype(np.int64)
+        base_day = int(epoch_days.min()); end_day = int(epoch_days.max())
+        height_day = (epoch_days - base_day).astype(np.int32)
+        n_days = end_day - base_day + 1
+        date_index = pd.Index(pd.to_datetime(np.arange(base_day, end_day + 1), unit="D", utc=True).date.astype(str), name="date")
+        day_dates = pd.to_datetime(date_index).date
+        pmap = {d: float(p) for d, p in zip(price_df["date"], price_df["price"])}
+        first_price = min(pmap)
+        last_price = max(pmap)
+        if day_dates[-1] > last_price:
+            raise RuntimeError(f"price series ends {last_price} before metrics range end {day_dates[-1]}")
+        px = np.full(n_days, np.nan, dtype=np.float64)
+        last = np.nan
+        for i, d in enumerate(day_dates):
+            if d in pmap: last = pmap[d]
+            if d >= first_price and np.isfinite(last): px[i] = last
+        price_valid = np.isfinite(px) & (px > 0)
+        cost_px = np.where(price_valid, px, 0.0)
+        LOG.info("calendar=%s..%s days=%s first_price=%s", date_index[0], date_index[-1], n_days, first_price)
+
+        tx = np.memmap(state_path / "tx_records.bin", dtype=TX_DTYPE, mode="r", shape=(sc["tx_count"],))
+        outs = np.memmap(state_path / "outputs.bin", dtype=OUT_DTYPE, mode="r", shape=(sc["out_count"],))
+        closes = np.memmap(state_path / "closes.bin", dtype=CLOSE_DTYPE, mode="r", shape=(sc["close_count"],))
+        scripts = np.memmap(state_path / "scripts.bin", dtype=np.uint8, mode="r", shape=(sc["script_bytes"],)) if sc["script_bytes"] else None
+        tx_validation = validate_tx_records(tx, sc)
+
+        created_sats = np.zeros(n_days, dtype=np.int64)
+        created_count = np.zeros(n_days, dtype=np.int64)
+        created_cost = np.zeros(n_days, dtype=np.float64)
+        created_coinbase_sats = np.zeros(n_days, dtype=np.int64)
+        eligible_output_count = 0
+        ineligible_output_count = 0
+        expected_script_offset = 0
+
+        out_chunk = max(100_000, int(args.output_chunk))
+        for s in range(0, sc["out_count"], out_chunk):
+            e = min(sc["out_count"], s + out_chunk)
+            o = outs[s:e]
+            txseq = np.asarray(o["tx_seq"], dtype=np.uint64)
+            if len(txseq) and int(txseq.max()) >= sc["tx_count"]:
+                raise RuntimeError(f"output tx_seq OOB in {s}..{e}")
+            vals = np.asarray(o["value_sats"], dtype=np.int64)
+            if np.any(vals < 0) or np.any(vals > MAX_MONEY_SATS):
+                raise RuntimeError(f"output value out of range in {s}..{e}")
+            trs = tx[txseq]
+            h = np.asarray(trs["height"], dtype=np.int64)
+            if len(h) and int(h.max()) > target:
+                raise RuntimeError(f"output created height beyond target in {s}..{e}")
+            oid = np.arange(s, e, dtype=np.uint64)
+            owner_first = np.asarray(trs["first_out"], dtype=np.uint64)
+            owner_vouts = np.asarray(trs["vout_count"], dtype=np.uint64)
+            if np.any((oid < owner_first) | (oid >= owner_first + owner_vouts)):
+                bad = int(np.flatnonzero((oid < owner_first) | (oid >= owner_first + owner_vouts))[0])
+                raise RuntimeError(f"OutputRecord owner/frontier mismatch output_id={s+bad}")
+            d = height_day[h]
+            oflags = np.asarray(o["flags"], dtype=np.uint32)
+            if np.any((oflags & ~np.uint32(OUT_FLAG_ELIGIBLE)) != 0):
+                raise RuntimeError(f"unknown OutputRecord flags in {s}..{e}")
+            lens = np.asarray(o["script_len"], dtype=np.uint32)
+            offs = np.asarray(o["script_offset"], dtype=np.uint64)
+            if len(lens) and np.any(offs + lens.astype(np.uint64) > np.uint64(sc["script_bytes"])):
+                raise RuntimeError(f"output script bounds violation in {s}..{e}")
+            if len(lens):
+                lens64 = lens.astype(np.uint64)
+                script_prefix = np.cumsum(lens64, dtype=np.uint64)
+                expected_offs = np.uint64(expected_script_offset) + script_prefix - lens64
+                if not np.array_equal(offs, expected_offs):
+                    bad = int(np.flatnonzero(offs != expected_offs)[0])
+                    raise RuntimeError(f"OutputRecord script frontier mismatch output_id={s+bad}")
+                expected_script_offset += int(script_prefix[-1])
+            first_is_opreturn = np.zeros(len(o), dtype=bool)
+            nz = lens > 0
+            if np.any(nz):
+                if scripts is None:
+                    raise RuntimeError("non-empty output scripts but scripts.bin is empty")
+                first_is_opreturn[nz] = np.asarray(scripts[offs[nz].astype(np.intp)], dtype=np.uint8) == np.uint8(0x6A)
+            expected_eligible = (h != 0) & (lens <= MAX_SCRIPT_SIZE) & (~first_is_opreturn)
+            eligible = (oflags & OUT_FLAG_ELIGIBLE) != 0
+            if not np.array_equal(eligible, expected_eligible):
+                bad = int(np.flatnonzero(eligible != expected_eligible)[0])
+                raise RuntimeError(f"OutputRecord eligibility flag mismatch output_id={s+bad}")
+            eligible_output_count += int(np.count_nonzero(eligible))
+            ineligible_output_count += int(len(eligible) - np.count_nonzero(eligible))
+            if np.any(eligible):
+                ed = d[eligible]; ev = vals[eligible]
+                add_at_int(created_sats, ed, ev)
+                created_count += np.bincount(ed, minlength=n_days).astype(np.int64)
+                add_at_float(created_cost, ed, (ev.astype(np.float64) / 1e8) * cost_px[ed])
+                cb = (np.asarray(trs["flags"], dtype=np.uint32)[eligible] & TX_FLAG_COINBASE) != 0
+                if np.any(cb): add_at_int(created_coinbase_sats, ed[cb], ev[cb])
+            if s == 0 or e == sc["out_count"] or (s // out_chunk) % 20 == 0:
+                LOG.info("outputs scanned=%s/%s", f"{e:,}", f"{sc['out_count']:,}")
+        if expected_script_offset != int(sc["script_bytes"]):
+            raise RuntimeError(f"OutputRecord script frontier={expected_script_offset} != checkpoint script_bytes={sc['script_bytes']}")
+
+        closed_sats = np.zeros(n_days, dtype=np.int64)
+        closed_count = np.zeros(n_days, dtype=np.int64)
+        closed_cost = np.zeros(n_days, dtype=np.float64)
+        spent_sats = np.zeros(n_days, dtype=np.int64)
+        spend_inputs = np.zeros(n_days, dtype=np.int64)
+        matched_inputs = np.zeros(n_days, dtype=np.int64)
+        asopr_matched_inputs = np.zeros(n_days, dtype=np.int64)
+        sopr_num = np.zeros(n_days, dtype=np.float64)
+        sopr_den = np.zeros(n_days, dtype=np.float64)
+        asopr_num = np.zeros(n_days, dtype=np.float64)
+        asopr_den = np.zeros(n_days, dtype=np.float64)
+        cdd = np.zeros(n_days, dtype=np.float64)
+        cohort_close = np.zeros((n_days, n_days), dtype=np.int64)
+        bip30_overwrite_count = 0
+        causality_clamped = 0
+        # One byte per output (~1.34 GiB at current target).  This independent set
+        # makes duplicate CloseRecords fail closed without relying on checkpoint arithmetic.
+        close_seen = np.zeros(sc["out_count"], dtype=np.bool_)
+
+        close_chunk = max(100_000, int(args.close_chunk))
+        for s in range(0, sc["close_count"], close_chunk):
+            e = min(sc["close_count"], s + close_chunk)
+            c = closes[s:e]
+            oid = np.asarray(c["output_id"], dtype=np.uint64)
+            closer = np.asarray(c["closer_tx_seq"], dtype=np.uint64)
+            typ = np.asarray(c["type"], dtype=np.uint32)
+            vin = np.asarray(c["vin"], dtype=np.uint32)
+            if len(oid) and int(oid.max()) >= sc["out_count"]:
+                raise RuntimeError(f"close output_id OOB in {s}..{e}")
+            # Detect duplicates within this chunk and against every earlier chunk.
+            # Sorting 2M uint64 ids is bounded and avoids a false-negative from fancy-index writes.
+            if len(oid) > 1:
+                ordered_oid = np.sort(oid.copy())
+                if np.any(ordered_oid[1:] == ordered_oid[:-1]):
+                    bad = int(ordered_oid[np.flatnonzero(ordered_oid[1:] == ordered_oid[:-1])[0]])
+                    raise RuntimeError(f"duplicate CloseRecord output_id={bad} within {s}..{e}")
+            if np.any(close_seen[oid.astype(np.intp, copy=False)]):
+                bad = int(oid[np.flatnonzero(close_seen[oid.astype(np.intp, copy=False)])[0]])
+                raise RuntimeError(f"duplicate CloseRecord output_id={bad} across chunks")
+            close_seen[oid.astype(np.intp, copy=False)] = True
+            if len(closer) and int(closer.max()) >= sc["tx_count"]:
+                raise RuntimeError(f"close closer_tx_seq OOB in {s}..{e}")
+            if np.any((typ != CLOSE_SPEND) & (typ != CLOSE_BIP30)):
+                raise RuntimeError(f"invalid close type in {s}..{e}")
+            if np.any((typ == CLOSE_BIP30) & (vin != NO_VIN)):
+                raise RuntimeError(f"BIP30 close vin contract mismatch in {s}..{e}")
+            if np.any((typ == CLOSE_SPEND) & (vin == NO_VIN)):
+                raise RuntimeError(f"normal spend close uses NO_VIN in {s}..{e}")
+            o = outs[oid]
+            if np.any((np.asarray(o["flags"], dtype=np.uint32) & OUT_FLAG_ELIGIBLE) == 0):
+                raise RuntimeError(f"close references ineligible output in {s}..{e}")
+            vals = np.asarray(o["value_sats"], dtype=np.int64)
+            created_tx = np.asarray(o["tx_seq"], dtype=np.uint64)
+            created_records = tx[created_tx]
+            closer_records = tx[closer]
+            ch = np.asarray(created_records["height"], dtype=np.int64)
+            sh = np.asarray(closer_records["height"], dtype=np.int64)
+            cti = np.asarray(created_records["tx_index"], dtype=np.int64)
+            sti = np.asarray(closer_records["tx_index"], dtype=np.int64)
+            noncausal = (sh < ch) | ((sh == ch) & (sti <= cti))
+            if np.any(noncausal):
+                raise RuntimeError(f"non-causal close position in {s}..{e}")
+            cd = height_day[ch]
+            sd_raw = height_day[sh]
+            clamp = sd_raw < cd
+            causality_clamped += int(np.count_nonzero(clamp))
+            sd = np.maximum(sd_raw, cd)
+            cts = times[ch]; sts = times[sh]
+            age_sec = np.maximum(sts - cts, 0).astype(np.int64)
+
+            add_at_int(closed_sats, sd, vals)
+            closed_count += np.bincount(sd, minlength=n_days).astype(np.int64)
+            add_at_float(closed_cost, sd, (vals.astype(np.float64) / 1e8) * cost_px[cd])
+            np.add.at(cohort_close, (sd.astype(np.intp), cd.astype(np.intp)), vals)
+
+            normal = typ == 1
+            bip30_overwrite_count += int(np.count_nonzero(typ == 2))
+            if np.any(normal):
+                nd = sd[normal]; nv = vals[normal]; ncd = cd[normal]; nage = age_sec[normal]
+                add_at_int(spent_sats, nd, nv)
+                spend_inputs += np.bincount(nd, minlength=n_days).astype(np.int64)
+                valid = price_valid[nd] & price_valid[ncd]
+                if np.any(valid):
+                    vd = nd[valid]; vv = nv[valid].astype(np.float64) / 1e8
+                    vcd = ncd[valid]
+                    matched_inputs += np.bincount(vd, minlength=n_days).astype(np.int64)
+                    add_at_float(sopr_num, vd, vv * px[vd])
+                    add_at_float(sopr_den, vd, vv * px[vcd])
+                    aged = valid & (nage >= 3600)
+                    if np.any(aged):
+                        ad = nd[aged]; av = nv[aged].astype(np.float64) / 1e8; acd = ncd[aged]
+                        asopr_matched_inputs += np.bincount(ad, minlength=n_days).astype(np.int64)
+                        add_at_float(asopr_num, ad, av * px[ad])
+                        add_at_float(asopr_den, ad, av * px[acd])
+                add_at_float(cdd, nd, (nv.astype(np.float64) / 1e8) * (nage.astype(np.float64) / 86400.0))
+            if s == 0 or e == sc["close_count"] or (s // close_chunk) % 20 == 0:
+                LOG.info("closes scanned=%s/%s", f"{e:,}", f"{sc['close_count']:,}")
+
+        if eligible_output_count + ineligible_output_count != sc["out_count"]:
+            raise RuntimeError("all output count extraction mismatch")
+        if int(created_count.sum()) != eligible_output_count:
+            raise RuntimeError("eligible created output count extraction mismatch")
+        if int(closed_count.sum()) != sc["close_count"]:
+            raise RuntimeError("close count extraction mismatch")
+        if int(np.count_nonzero(close_seen)) != sc["close_count"]:
+            raise RuntimeError("CloseRecord uniqueness cardinality mismatch")
+        if eligible_output_count - sc["close_count"] != sc["live_count"]:
+            raise RuntimeError(f"eligible-close-live arithmetic mismatch eligible={eligible_output_count} close={sc['close_count']} live={sc['live_count']}")
+        final_live_count = int((created_count - closed_count).sum())
+        final_live_value = int((created_sats - closed_sats).sum())
+        if final_live_count != sc["live_count"]:
+            raise RuntimeError(f"extracted live_count={final_live_count} != checkpoint={sc['live_count']}")
+        if final_live_value != sc["live_value_sats"]:
+            raise RuntimeError(f"extracted live_value={final_live_value} != checkpoint={sc['live_value_sats']}")
+
+        supply_sats = np.cumsum(created_sats - closed_sats, dtype=np.int64)
+        live_count_series = np.cumsum(created_count - closed_count, dtype=np.int64)
+        if int(supply_sats[-1]) != sc["live_value_sats"] or int(live_count_series[-1]) != sc["live_count"]:
+            raise RuntimeError("terminal daily state does not match checkpoint")
+        supply_btc = supply_sats.astype(np.float64) / 1e8
+        realized_cap = np.cumsum(created_cost - closed_cost, dtype=np.float64)
+        market_cap = supply_btc * px
+        realized_price = safe_div(realized_cap, supply_btc)
+        mvrv = safe_div(market_cap, realized_cap)
+        mc_series = pd.Series(market_cap, index=date_index, dtype="float64")
+        expanding_std = mc_series.expanding(min_periods=2).std(ddof=0).to_numpy(dtype=np.float64)
+        mvrv_z = safe_div(market_cap - realized_cap, expanding_std)
+        sopr = safe_div(sopr_num, sopr_den)
+        asopr = safe_div(asopr_num, asopr_den)
+        coverage = safe_div(matched_inputs.astype(np.float64), spend_inputs.astype(np.float64))
+        asopr_coverage = safe_div(asopr_matched_inputs.astype(np.float64), spend_inputs.astype(np.float64))
+        dormancy = safe_div(cdd, spent_sats.astype(np.float64) / 1e8)
+
+        LOG.info("computing HODL waves over %s calendar days", n_days)
+        hodl = compute_hodl(created_sats, cohort_close, date_index)
+        if not np.isclose(sum(float(h.iloc[-1]) for h in hodl.values()), 1.0, rtol=0, atol=1e-12):
+            raise RuntimeError("terminal HODL wave shares do not sum to 1")
+
+        series: Dict[str, pd.Series] = {
+            "utxo_supply_btc": pd.Series(supply_btc, index=date_index),
+            "utxo_live_utxo_count": pd.Series(live_count_series.astype(np.float64), index=date_index),
+            "utxo_created_btc": pd.Series(created_sats.astype(np.float64)/1e8, index=date_index),
+            "utxo_closed_btc": pd.Series(closed_sats.astype(np.float64)/1e8, index=date_index),
+            "utxo_spent_btc": pd.Series(spent_sats.astype(np.float64)/1e8, index=date_index),
+            "utxo_cap_real_usd": pd.Series(realized_cap, index=date_index),
+            "utxo_realized_price": pd.Series(realized_price, index=date_index),
+            "utxo_cap_mrkt_cur_usd": pd.Series(market_cap, index=date_index),
+            "utxo_mvrv": pd.Series(mvrv, index=date_index),
+            "utxo_mvrv_zscore": pd.Series(mvrv_z, index=date_index),
+            "utxo_sopr": pd.Series(sopr, index=date_index),
+            "utxo_asopr": pd.Series(asopr, index=date_index),
+            "utxo_cdd": pd.Series(cdd, index=date_index),
+            "utxo_dormancy": pd.Series(dormancy, index=date_index),
+            "utxo_raw_inputs": pd.Series(spend_inputs.astype(np.float64), index=date_index),
+            "utxo_sopr_coverage_cnt": pd.Series(matched_inputs.astype(np.float64), index=date_index),
+            "utxo_sopr_coverage_rate": pd.Series(coverage, index=date_index),
+            "utxo_asopr_coverage_cnt": pd.Series(asopr_matched_inputs.astype(np.float64), index=date_index),
+            "utxo_asopr_coverage_rate": pd.Series(asopr_coverage, index=date_index),
+        }
+        for name, s in hodl.items(): series[f"utxo_hodl_{name}"] = s
+
+        # Build a complete candidate release off to the side.  The old GREEN manifest
+        # remains authoritative until ALL calculations and final snapshot checks pass.
+        staging_dir = output_dir / f".staging.{os.getpid()}.{time.time_ns()}"
+        staging_dir.mkdir(parents=True, exist_ok=False)
+        staged_outputs: Dict[str, Dict[str, Any]] = {}
+        try:
+            for name, ser in sorted(series.items()):
+                staged_path = staging_dir / f"{name}.csv"
+                meta = write_csv_durable(staged_path, ser)
+                staged_outputs[name] = {
+                    "path": str((output_dir / f"{name}.csv").resolve()),
+                    "sha256": meta["sha256"], "rows": meta["rows"], "size": meta["size"],
+                }
+            fsync_dir(staging_dir)
+
+            validate_stage_tokens(stage_tokens)
+            validate_state_tokens(state_tokens)
+            final_state = parse_state(state_path)
+            if final_state["checkpoint_sha256"] != sc["checkpoint_sha256"] or final_state["meta_sha256"] != sc["meta_sha256"]:
+                raise RuntimeError("V50 state identity changed during metrics run")
+
+            manifest = {
+            "schema": "mybot-utxo-metrics-v4-manifest-v1",
+            "status": "GREEN",
+            "version": VERSION,
+            "api_schema": METRICS_API_SCHEMA,
+            "created_utc": utc_now(),
+            "elapsed_sec": round(time.monotonic() - started, 3),
+            "metrics_code_sha256": sha256_file(Path(__file__).resolve()),
+            "state": sc,
+            "calculator_contract": calculator,
+            "r12_provenance": provenance,
+            "dense_state_validation": tx_validation,
+            "stage": stage,
+            "independent_state_audit_evidence": state_audit,
+            "core_chain_guard": guard,
+            "price": {"path": str(price_path.resolve()), "sha256": price_sha, "first_date": str(first_price), "last_date": str(last_price)},
+            "calendar": {"start": str(date_index[0]), "end": str(date_index[-1]), "days": n_days, "block_timestamp_causality_clamped_closes": causality_clamped},
+            "policy": {
+                "canonical_input": "V50_DENSE_STATE_PLUS_CANONICAL_STAGE_BLOCK_TIME",
+                "supply_definition": "sum(value_sats) of eligible and unclosed V50 outputs; not consensus-issued supply",
+                "output_eligibility": "exact dense-core: height!=0, script_len<=10000, first_byte!=OP_RETURN; flag independently revalidated from scripts.bin",
+                "aws_raw_used": False,
+                "pre_price_created_cost_basis_usd": 0,
+                "asopr_min_age_seconds": 3600,
+                "cdd_age_basis": "max(spent_block_time-created_block_time,0)/86400",
+                "mvrv_zscore_formula": "(market_cap-realized_cap)/expanding_std(market_cap,ddof=0)",
+                "bip30_overwrite_semantics": "removes UTXO inventory/cost basis; excluded from SOPR,aSOPR,CDD,dormancy,raw_inputs",
+                "calendar_close_causality": "if raw block timestamp UTC day of close precedes created day, close day is clamped to created day for inventory/HODL accounting",
+            },
+            "counts": {
+                "outputs": sc["out_count"], "eligible_outputs_created": eligible_output_count, "ineligible_outputs_created": ineligible_output_count,
+                "closes": sc["close_count"], "normal_spends": int(spend_inputs.sum()),
+                "bip30_overwrites": bip30_overwrite_count, "terminal_live_count": final_live_count,
+                "terminal_live_value_sats": final_live_value,
+            },
+            "terminal_checks": {
+                "checkpoint_live_count_match": final_live_count == sc["live_count"],
+                "checkpoint_live_value_match": final_live_value == sc["live_value_sats"],
+                "state_stable": True, "stage_block_payloads_stable": True,
+            },
+            "locks": freeze.summary(),
+            "outputs": staged_outputs,
+        }
+            manifest["manifest_payload_sha256"] = canonical_sha(manifest)
+
+            # Commit protocol: remove any prior GREEN commit marker first, then promote
+            # all candidate CSVs on the same filesystem, and write the new manifest LAST.
+            # A crash during promotion therefore leaves no GREEN manifest over mixed bytes.
+            manifest_path = output_dir / "utxo_metrics_v4_manifest.json"
+            if manifest_path.exists():
+                manifest_path.unlink()
+                fsync_dir(output_dir)
+            for name in sorted(series):
+                os.replace(staging_dir / f"{name}.csv", output_dir / f"{name}.csv")
+            fsync_dir(output_dir)
+            atomic_json(manifest_path, manifest)
+            LOG.info("GREEN metrics written to %s", output_dir)
+            return manifest
+        finally:
+            shutil.rmtree(staging_dir, ignore_errors=True)
+
+
+def preflight(args: argparse.Namespace) -> Dict[str, Any]:
+    state_path = Path(args.state)
+    with FreezeLease(state_path) as freeze:
+        sc = parse_state(state_path)
+        calculator = validate_calculator_contract(sc, Path(args.supervisor), Path(args.driver), Path(args.core))
+        provenance = validate_r12_provenance(state_path, sc)
+        target = int(sc["height"])
+        if args.expected_height is not None and target != int(args.expected_height):
+            raise RuntimeError(f"state height={target} != expected-height={args.expected_height}")
+        times, _, stage, stage_tokens = load_legacy_stage_blocks(Path(args.stage_base), target, args.threads, args.memory_limit)
+        if stage["target_hash"] != sc["block_hash"]:
+            raise RuntimeError("Stage/state target hash mismatch")
+        if str(stage["global_sha256"]).lower() != str(provenance["stage_source_sha256"]).lower():
+            raise RuntimeError(
+                f"Stage/APPLY source mismatch stage={stage['global_sha256']} "
+                f"apply_terminal={provenance['stage_source_sha256']} current_state={sc['source_sha256']}"
+            )
+        state_audit = validate_state_audit_evidence(
+            Path(args.state_audit_report) if args.state_audit_report else None, args.state_audit_report_sha256,
+            sc, stage, provenance, args.allow_no_state_audit_report,
+        )
+        guard = locate_core_chain_report(Path(args.audit_dir), target, Path(args.core_chain_report) if args.core_chain_report else None, args.core_chain_report_sha256, sc, stage, args.allow_no_core_chain_report)
+        price_path = Path(args.price)
+        prices = read_price(price_path)
+        epoch_days = np.floor_divide(times, 86400).astype(np.int64)
+        n_days = int(epoch_days.max() - epoch_days.min() + 1)
+        validate_stage_tokens(stage_tokens)
+        result = {
+            "status": "READY", "version": VERSION, "api_schema": METRICS_API_SCHEMA,
+            "state": sc, "calculator_contract": calculator, "r12_provenance": provenance,
+            "stage": stage, "independent_state_audit_evidence": state_audit, "core_chain_guard": guard,
+            "price": {"path": str(price_path.resolve()), "sha256": sha256_file(price_path), "first_date": str(prices["date"].min()), "last_date": str(prices["date"].max())},
+            "calendar_days": n_days, "cohort_matrix_estimated_mib": round(n_days*n_days*8/(1<<20), 1),
+            "locks": freeze.summary(),
+        }
+        return result
+
+
+def selftest() -> int:
+    assert TX_DTYPE.itemsize == 56 and OUT_DTYPE.itemsize == 32 and CLOSE_DTYPE.itemsize == 24
+    dates = pd.Index(["2020-01-01","2020-01-02","2020-01-03"], name="date")
+    created = np.array([100, 50, 25], dtype=np.int64)
+    closures = np.zeros((3,3), dtype=np.int64)
+    closures[1,0] = 40
+    closures[2,1] = 10
+    h = compute_hodl(created, closures, dates)
+    final = 125
+    assert abs(float(h["0_1d"].iloc[-1]) - 25/final) < 1e-12
+    assert abs(float(h["1d_1w"].iloc[-1]) - 100/final) < 1e-12
+    assert abs(sum(float(x.iloc[-1]) for x in h.values()) - 1.0) < 1e-12
+    a = np.array([1.0, 2.0]); b = np.array([1.0, 0.0]); r = safe_div(a,b)
+    assert r[0] == 1.0 and np.isnan(r[1])
+
+    # R12 source-lineage contract: historical APPLY records retain their source
+    # SHA, while the lineage terminal binds the current state source.
+    source_a, source_b = "aa" * 32, "bb" * 32
+    fingerprint = "cc" * 32
+    lineage_record_sha = "dd" * 32
+    epoch = {
+        "record_no": 1, "action": PROVENANCE_EPOCH_ACTION,
+        "source_sha256": source_a,
+        "r11_engine_sha256": EXPECTED_R11_SHA256,
+        "supervisor_sha256": EXPECTED_R12_SHA256,
+    }
+    transition = {
+        "record_no": 1, "record_sha256": lineage_record_sha,
+        "action": "SOURCE_EXTENSION_COMMIT",
+        "old_source_sha256": source_a, "new_source_sha256": source_b,
+        "old_source_fingerprint_sha256": "01" * 32,
+        "new_source_fingerprint_sha256": "02" * 32,
+        "pre_fingerprint_sha256": fingerprint,
+        "post_fingerprint_sha256": fingerprint,
+        "committed_height": 10, "committed_block_hash": "03" * 32,
+        "historical_execution_provenance_changed": False,
+        "r11_engine_sha256": EXPECTED_R11_SHA256,
+        "supervisor_sha256": EXPECTED_R12_SHA256,
+        "prefix_equivalence": {
+            "status": "GREEN", "windows_checked": 1, "through_height": 10,
+            "window_fingerprint_compatible": True,
+            "window_fingerprint_schema": WINDOW_FINGERPRINT_SCHEMA,
+        },
+    }
+    recovery_upgrade = {
+        "record_no": 2, "action": "SOURCE_UPGRADE_COMMITTED",
+        "old_source_sha256": source_a, "new_source_sha256": source_b,
+        "committed_height": 10, "lineage_record_sha256": lineage_record_sha,
+        "semantic_fingerprint_unchanged": True,
+        "r11_engine_sha256": EXPECTED_R11_SHA256,
+        "supervisor_sha256": EXPECTED_R12_SHA256,
+    }
+    apply_old = [{"record_no": 1, "h1": 0, "h2": 10, "source_sha256": source_a}]
+    lineage_ok = _validate_source_lineage(
+        apply_old, [epoch, recovery_upgrade], [transition], source_b, 10
+    )
+    assert lineage_ok["terminal_source_sha256"] == source_b
+    assert lineage_ok["apply_terminal_source_sha256"] == source_a
+
+    apply_extended = [
+        *apply_old,
+        {"record_no": 2, "h1": 11, "h2": 20, "source_sha256": source_b},
+    ]
+    lineage_extended = _validate_source_lineage(
+        apply_extended, [epoch, recovery_upgrade], [transition], source_b, 20
+    )
+    assert lineage_extended["apply_terminal_source_sha256"] == source_b
+    no_upgrade = _validate_source_lineage(apply_old, [epoch], [], source_a, 10)
+    assert no_upgrade["records"] == 0 and no_upgrade["terminal_source_sha256"] == source_a
+
+    def expect_lineage_failure(apply_rows, recovery_rows, lineage_rows, state_source, state_height):
+        try:
+            _validate_source_lineage(apply_rows, recovery_rows, lineage_rows, state_source, state_height)
+        except RuntimeError:
+            return
+        raise AssertionError("invalid source lineage was accepted")
+
+    expect_lineage_failure(apply_old, [epoch], [], source_b, 10)
+    expect_lineage_failure(
+        [{"record_no": 1, "h1": 0, "h2": 10, "source_sha256": source_b}],
+        [epoch, recovery_upgrade], [transition], source_b, 10,
+    )
+    expect_lineage_failure(
+        apply_old, [epoch, recovery_upgrade],
+        [{**transition, "post_fingerprint_sha256": "ee" * 32}], source_b, 10,
+    )
+    expect_lineage_failure(apply_old, [epoch], [transition], source_b, 10)
+
+    # Physical state-contract parser smoke with tiny synthetic sparse files.
+    with tempfile.TemporaryDirectory() as td:
+        st = Path(td) / "state"; st.mkdir()
+        (st / "LOCK").write_bytes(b"")
+        (st / "scripts.bin").write_bytes(b"")
+        txcap, outcap, closecap, hashcap = 2, 3, 1, 1024
+        src = bytes.fromhex("11"*32); core = bytes.fromhex("22"*32); drv = bytes.fromhex(EXPECTED_R11_SHA256)
+        m0 = META.pack(b"V50META1",3,0x01020304,txcap,outcap,closecap,hashcap,56,32,24,40,src,core,drv,b"\0"*32)
+        m = m0[:-32] + hashlib.sha256(m0[:-32]).digest(); (st/"state.meta").write_bytes(m)
+        c0 = CHECKPOINT.pack(b"V50CP01\x00",3,1,bytes.fromhex("33"*32),2,3,1,0,2,75,0,0,src,b"\0"*32)
+        c = c0[:-32] + hashlib.sha256(c0[:-32]).digest(); (st/"checkpoint.bin").write_bytes(c)
+        (st/"tx_records.bin").write_bytes(b"\0"*(txcap*56))
+        (st/"outputs.bin").write_bytes(b"\0"*(outcap*32))
+        (st/"closes.bin").write_bytes(b"\0"*(closecap*24))
+        parsed = parse_state(st)
+        assert parsed["height"] == 1 and parsed["live_count"] == 2 and parsed["live_value_sats"] == 75
+    print("UTXO_METRICS_V4 SELFTEST GREEN")
+    return 0
+
+
+def parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(description="Read-only V50 dense-state UTXO indicators")
+    p.add_argument("--state", default=str(DEFAULT_STATE))
+    p.add_argument("--supervisor", default="/root/mybot/utxo_pipeline_v50_r12_9.py", help="exact production R12.9 supervisor")
+    p.add_argument("--driver", default="/root/mybot/utxo_pipeline_v50.py", help="exact certified R11 driver bytes")
+    p.add_argument("--core", default="/opt/mybot_data/etl/utxo_v50/runtime/utxo_v50_dense_core", help="production dense-core binary bound by state.meta")
+    p.add_argument("--stage-base", default=str(DEFAULT_STAGE_BASE))
+    p.add_argument("--price", default=str(DEFAULT_PRICE))
+    p.add_argument("--output-dir", default=str(DEFAULT_OUTPUT))
+    p.add_argument("--work-dir", default=str(DEFAULT_WORK))
+    p.add_argument("--audit-dir", default=str(DEFAULT_AUDIT_DIR))
+    p.add_argument("--state-audit-report", help="exact immutable V51.5.2 heavy-proof FATAL JSON (failed only at historical reference)")
+    p.add_argument("--state-audit-report-sha256", help="required exact SHA256 pin for independent state-audit evidence")
+    p.add_argument("--allow-no-state-audit-report", action="store_true", help="diagnostic only; production requires heavy Stage->UTXO evidence")
+    p.add_argument("--core-chain-report", help="explicit V51.5.4 standalone core-chain guard JSON")
+    p.add_argument("--core-chain-report-sha256", help="optional exact SHA256 pin for core-chain evidence")
+    p.add_argument("--allow-no-core-chain-report", action="store_true", help="diagnostic only; production default requires guard evidence")
+    p.add_argument("--expected-height", type=int)
+    p.add_argument("--threads", type=int, default=10)
+    p.add_argument("--memory-limit", default="12GiB")
+    p.add_argument("--output-chunk", type=int, default=5_000_000)
+    p.add_argument("--close-chunk", type=int, default=2_000_000)
+    p.add_argument("--preflight", action="store_true", help="validate state/stage/guard/price without scanning outputs/closes")
+    p.add_argument("--selftest", action="store_true")
+    p.add_argument("--identity", action="store_true", help="print stable metrics API identity as JSON")
+    return p
+
+
+def main(argv: Optional[Sequence[str]] = None) -> int:
+    args = parser().parse_args(argv)
+    if args.identity:
+        print(json.dumps({
+            "status": "GREEN", "version": VERSION, "api_schema": METRICS_API_SCHEMA,
+        }, ensure_ascii=False, indent=2, sort_keys=True))
+        return 0
+    if args.selftest:
+        return selftest()
+    if args.preflight:
+        print(json.dumps(preflight(args), ensure_ascii=False, indent=2, sort_keys=True))
+        return 0
+    manifest = build_metrics(args)
+    print(json.dumps({
+        "status": manifest["status"], "version": manifest["version"],
+        "height": manifest["state"]["height"], "live_count": manifest["counts"]["terminal_live_count"],
+        "live_value_sats": manifest["counts"]["terminal_live_value_sats"],
+        "manifest": str((Path(args.output_dir)/"utxo_metrics_v4_manifest.json").resolve()),
+        "manifest_payload_sha256": manifest["manifest_payload_sha256"],
+    }, ensure_ascii=False, indent=2, sort_keys=True))
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main())
+    except KeyboardInterrupt:
+        raise
+    except Exception as exc:
+        LOG.exception("UTXO metrics v4 FAILED: %s", exc)
+        raise

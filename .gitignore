@@ -1,0 +1,83 @@
+# Python
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+
+# Runtime / data
+data/
+logs/
+backups/
+archive/
+old/
+o/
+*.log
+nohup.out
+*.jsonl
+
+# Measurements / temporary results
+measure-*
+stage-prefix-*.log
+upgrade-source-*.log
+raw_days.txt
+
+# Archives / release artifacts
+*.zip
+*.tar
+*.tar.gz
+*.tgz
+
+# tikctl generated/install trees
+tikctl-*-install*/
+tikctl-*.install*/
+tikctl-0817-install*/
+tikctl-0818-install*/
+tikctl-0819-install*/
+tikctl-0819-*.*/
+
+# Backups
+*.bak
+*.rejected-*
+
+# Secrets / environment
+.env
+.env.*
+*.key
+*.pem
+*.p12
+*.pfx
+credentials*
+secrets*
+
+# Historical local releases / old working trees
+tikctl-*/
+utxo_core_v2_v*/
+*.before-*
+pip_freeze_before_*.txt
+
+# Historical/experimental pipeline revisions
+utxo_pipeline_v10_*.py
+utxo_pipeline_v30.py
+utxo_pipeline_v40.py
+utxo_pipeline_v41.py
+utxo_pipeline_v50_r12_7.py
+utxo_pipeline_v50_r12_8.py
+utxo_pipeline_v50_r12_9.py
+
+# Historical auditors
+utxo_pipeline_audit_n*.py
+utxo_pipeline_audit_v10_*.py
+utxo_pipeline_audit_v50_r*.py
+utxo_pipeline_audit_v51_2.py
+utxo_pipeline_audit_v51_3.py
+utxo_pipeline_audit_v51_4.py
+utxo_pipeline_audit_v51_4_1.py
+utxo_pipeline_audit_v51_5_2.py
+utxo_pipeline_audit_v51_5_3.py
+utxo_pipeline_audit_v51_5_4.py
+
+# Local scratch
+0
+*.pre-*

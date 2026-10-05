@@ -1,0 +1,59 @@
+{
+  "architecture": "SOURCE->STAGE->APPLY->AUDIT",
+  "baseline": {
+    "end_hash": "000000000000000000095ad21001856998971c4951123d14276b5f13c45e83d8",
+    "end_height": 617698,
+    "muhash_certification": "PENDING_SEPARATE_EXACT_AUDITOR",
+    "muhash_expected": "7cd84c4159bf0459830f27857fdb26fc656efdb4dffdf568f545e04d6487e6e4",
+    "total_sats": 1822105482121089,
+    "txouts": 65419258
+  },
+  "contracts": {
+    "apply_writer_threads": 1,
+    "automatic_destructive_recovery": false,
+    "run_contract": "utxo-core-v2-run-contract-v1",
+    "source_catalog": "utxo-source-catalog-v2",
+    "source_snapshot": "utxo-source-snapshot-v2",
+    "source_snapshot_chain_mode": "physical-prevhash-v1",
+    "stage_release": "mybot-stage2-release-v2",
+    "target_immutable": true
+  },
+  "files": {
+    "build_stage.py": "efdd174b413c7afaa854e39fbd6ad13fdac660d0062314596d615d2e26ad5637",
+    "utxo": "b975c83cd795415679c9c37ed39451196a422dd49631baff971d0f04d7714c5d",
+    "utxo_operator/__init__.py": "0c16da3d40ff2c0d8512ae3cf5f1ef02fb83bd00bf1fdfa0d7072276eb0de85b",
+    "utxo_operator/cli.py": "735ff4c858d67c6c536e89404624d42fd0f685a40a8ff80e3e217c78db0b144d",
+    "utxo_operator/config.py": "e34fac2a4687a5c539514bc9f137f82cef145c240f52b3882d728c9bb6bca663",
+    "utxo_operator/core.py": "7052c4b13d8029338f6e34bfd04e132cebac1280adc673edd964775dd229b53d",
+    "utxo_operator/legacy.py": "da015595697f532667d7a4ce47d16ee8d629edbbe8e50aeeaef8040ea24454fe",
+    "utxo_operator/orchestrator.py": "e36f34dca96da21eedd6699011feb7739212c1a6917b07746609824d240bc300",
+    "utxo_operator/renderer.py": "035a7f432af2ceae12187250d113972b67a9b3f1c7cc30fcfb554c872aad54bc",
+    "utxo_operator/safety.py": "7633f96a8402b5cdc77f444fdf158a81f371f4da1405df267c7ac421f139f135",
+    "utxo_operator/state.py": "e86b886a857bd7435107252e60c7b18b704e5526087a361241f2affea773f198",
+    "utxo_operator/util.py": "afe73ce226f0a301aa8d838ecfab472b39f981c27e5b999b0fde7a31b4f2132b",
+    "utxo_operator/verify.py": "a904f2d5546fa196d39ab3c10bf465c3585ce107e654e3f5768e03e6393e8eab",
+    "utxo_pipeline_audit_n41.py": "48bc36832302d8281d5688215fc45f5f8c93bb760184d4eff145508bffee8b07",
+    "utxo_pipeline_v41.py": "2944fdde114d73887fbb9672fa6e7baceb3218eab5f052e1acff9c4f8da7be9b",
+    "verify_utxo_pipeline_v41_static.py": "b8c07d64af5792312d1dc5f821d6ff177666b6b8765fa15735795d7504a54f19"
+  },
+  "frozen_data_references": {
+    "block_files_inventory.tsv": "e14cd67e47492c32e0f796782744878ab2c02c2b5b89b05dd0c339a27aee041c",
+    "block_locator_0_617698.tsv": "0e045ecee898095f1a35789c2d21efccc737b390e998c2a0c79c6bf659c516ed",
+    "canonical_chain_0_617698.tsv": "5227507e9b38fbdb63040c1e197cdfb9b39cc2d054c6744722113206c4847161",
+    "canonical_transactions_0_617698.json": "3dc4e285947651d0c36bf5564c6f424d620947d29f36154ffa1cbb1dbe94860a"
+  },
+  "frozen_references": {
+    "build_block_locator.py": "d80ac36c2eb6490aa7aabdb70ebf4eee45f18160946e8e3812256a8c6669522b",
+    "build_canonical_transactions.py": "7309d10a509d518738c94e9604e2a9f8dba1cc7e190a5f21f3a8df01146f5730",
+    "stage2_decoder_preflight.py": "a981378473ea41f157eaf94c7de233ddbdab1985a4a618fd3962696c6cfa3ec9",
+    "utxo_pipeline_v30.py": "d8bd57a9702ef0a93afd0b51f9232306645827a93fea0253fb64e4d87f63921a",
+    "utxo_pipeline_v40.py": "08b376031ccf73f0292574c45dc50b1ce358b31a9abe6ddc6cf7f04cb6cda46c"
+  },
+  "release": "2.0.0-rc2.1",
+  "runtime": {
+    "bitcoin_core": "31.1",
+    "duckdb": "1.4.4",
+    "python": "3.9.x"
+  },
+  "schema": "utxo-core-v2-release-manifest-v1"
+}
