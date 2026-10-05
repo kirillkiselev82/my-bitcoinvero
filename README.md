@@ -1,5 +1,14 @@
 # Snapshot2
-
+> [!WARNING]
+> **Educational and non-commercial research use only.**
+>
+> BitcoinVero source code is provided for study, testing, and non-commercial research.
+>
+> **Commercial use, production use, SaaS/API hosting, redistribution, publication of modified versions, and incorporation into commercial products are prohibited without prior written permission.**
+>
+> This is **not an open-source license**.
+>
+> See [LICENSE](LICENSE) for the complete terms.
 
 
 ## Getting started
