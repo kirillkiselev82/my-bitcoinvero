@@ -1,145 +1,293 @@
 BitcoinVero Educational Use License
-Version 1.0 — October 2026
+Version 1.2 — October 2026
 
 Copyright (c) 2026 Kirill Kiselev
 All rights reserved.
 
-1. PURPOSE
+IMPORTANT: THIS IS NOT AN OPEN-SOURCE LICENSE.
 
-The software, source code, documentation, algorithms, data-processing
-methods, and related materials contained in this repository
-(the "Software") are made available solely for educational,
-academic, and non-commercial research purposes.
+The Software is made available under a limited source-available license
+solely for educational and non-commercial research purposes.
 
-This license is not an open-source license.
+No rights are granted except those expressly stated below.
 
-2. PERMITTED USE
 
-Subject to the terms of this license, you are granted a limited,
-non-exclusive, non-transferable, revocable license to:
+1. DEFINITIONS
 
-a) view and study the source code;
+"Software" means all source code, scripts, algorithms, documentation,
+configuration examples, schemas, specifications, data-processing logic,
+verification logic, audit logic, build logic, and other materials made
+available in this repository by the copyright holder.
 
-b) download and run the Software privately for personal education,
-   academic study, testing, or non-commercial research;
+"Educational Use" means personal study, classroom study, academic learning,
+or private experimentation whose primary purpose is education and which has
+no commercial, production, operational, or revenue-generating purpose.
 
-c) modify the Software privately for those permitted purposes;
+"Non-Commercial Research" means bona fide research performed without direct
+or indirect commercial benefit, production use, customer delivery, paid
+service, product development, competitive product development, or commercial
+deployment.
 
-d) use limited portions of the Software for educational discussion,
-   provided that appropriate attribution to BitcoinVero and the
-   original copyright holder is retained.
+"Commercial Use" includes any use that directly or indirectly supports,
+benefits, enables, evaluates, develops, improves, or forms part of a
+commercial activity, business, product, service, consultancy, employment
+activity, revenue-generating activity, or paid engagement.
+
+"Production Use" means use of the Software in any live, operational,
+customer-facing, business-critical, revenue-related, decision-support,
+financial, hosted, continuously operated, or materially relied-upon system.
+
+
+2. LIMITED LICENSE GRANT
+
+Subject to full compliance with this License, the copyright holder grants
+you a limited, non-exclusive, non-transferable, non-sublicensable,
+revocable license to:
+
+a) view and study the Software;
+
+b) download and run the Software privately for Educational Use;
+
+c) run the Software privately for bona fide Non-Commercial Research;
+
+d) make private modifications solely for those permitted purposes;
+
+e) quote limited portions of the Software for educational discussion,
+   academic commentary, or research criticism, provided that copyright
+   notices and appropriate attribution to BitcoinVero are retained.
+
+All rights not expressly granted are reserved.
+
 
 3. PROHIBITED USE
 
 Without prior written permission from the copyright holder, you may not:
 
-a) use the Software, in whole or in part, for any commercial purpose;
+a) use the Software, in whole or in part, for Commercial Use;
 
-b) use the Software in a production environment;
+b) use the Software in any Production Use;
 
-c) use the Software to provide paid or unpaid services to third parties;
+c) use the Software to provide services to any third party, whether paid
+   or unpaid;
 
-d) operate the Software as part of a SaaS, hosted service, API service,
-   analytics service, data service, financial service, or commercial
-   infrastructure;
+d) operate or expose the Software as, or as part of, a SaaS service,
+   hosted service, API service, analytics service, data service,
+   blockchain service, financial service, monitoring service,
+   infrastructure service, or managed service;
 
-e) sell, sublicense, rent, lease, monetize, or otherwise commercially
-   exploit the Software;
+e) use the Software to build, operate, support, evaluate, or improve a
+   competing or substantially similar commercial product or service;
 
-f) redistribute, republish, mirror, or make available copies or
-   modified versions of the Software, except where expressly permitted
-   in writing by the copyright holder;
+f) sell, sublicense, rent, lease, monetize, commercialize, license,
+   assign, transfer, or otherwise commercially exploit the Software;
 
-g) incorporate the Software or substantial portions of it into another
-   software product, platform, service, or commercial project;
+g) redistribute, republish, mirror, upload, distribute, or otherwise make
+   available copies of the Software or substantial portions of it;
 
-h) remove, conceal, or alter copyright notices, attribution notices,
-   license terms, or other proprietary notices;
+h) publish, distribute, or make available modified versions, forks,
+   derivative works, adaptations, ports, or substantial portions of the
+   Software;
 
-i) represent any modified version as an official BitcoinVero release;
+i) incorporate the Software or substantial portions of it into another
+   software product, platform, service, library, application, commercial
+   project, or production system;
 
-j) use the BitcoinVero name, trademarks, logos, or branding in a manner
-   that implies endorsement, sponsorship, affiliation, or authorization.
+j) use the Software in connection with investment execution, automated
+   trading, custody, brokerage, financial decision-making, or other
+   production financial activity;
 
-4. EDUCATIONAL AND RESEARCH USE ONLY
+k) remove, obscure, modify, bypass, disable, or conceal copyright notices,
+   attribution notices, license notices, provenance markers, integrity
+   checks, safety controls, or proprietary notices;
 
-Permitted educational or research use must be genuinely non-commercial.
+l) represent any modified, derived, copied, or independently deployed
+   version as an official BitcoinVero release;
 
-Use by a commercial entity, employee, contractor, consultant, or other
-person acting on behalf of a commercial organization is not automatically
-permitted merely because the activity is described as research,
-evaluation, testing, training, or education.
+m) use the BitcoinVero name, trademarks, logos, domain names, trade dress,
+   or branding in any manner that suggests affiliation, sponsorship,
+   endorsement, authorization, or official status;
 
-Written permission is required where there is any reasonable connection
-between use of the Software and commercial activity.
+n) use the Software or substantial portions of it for training,
+   fine-tuning, distillation, reinforcement learning, evaluation,
+   benchmarking, dataset construction, retrieval corpora, code-generation
+   training, embedding corpora, synthetic-data generation, or other
+   development or improvement of machine-learning or artificial-intelligence
+   models or systems;
 
-5. MODIFICATIONS
+o) provide the Software, source code, substantial excerpts, derived code,
+   structural representations, or machine-readable transformations of the
+   Software to an AI or machine-learning system for purposes prohibited
+   by paragraph (n);
 
-Private modifications are permitted solely for the purposes described
-in Section 2.
+p) circumvent or attempt to circumvent the restrictions of this License
+   through an affiliate, contractor, intermediary, hosted environment,
+   automated agent, or other third party.
 
-Distribution or publication of modified versions, forks, derivative
-works, or substantial portions of the Software requires prior written
-permission from the copyright holder.
 
-6. NO PATENT OR TRADEMARK LICENSE
+4. COMMERCIAL ORGANIZATIONS
 
-No patent, trademark, trade name, logo, service mark, or other branding
-rights are granted under this license.
+Use by a company, commercial organization, employee, contractor,
+consultant, service provider, or person acting on behalf of such an
+organization is not presumed to be Educational Use or Non-Commercial
+Research.
 
-In particular, this license does not grant any right to use the
-BitcoinVero name or branding.
+Calling an activity "research", "evaluation", "testing", "proof of concept",
+"training", "internal use", or "education" does not make it permitted if the
+activity directly or indirectly supports a commercial objective.
 
-7. THIRD-PARTY COMPONENTS
+Prior written permission is required whenever there is a reasonable
+commercial connection to the intended use.
 
-Third-party software, libraries, code, or other materials included in
-or used by the Software remain subject to their respective licenses.
 
-Nothing in this license modifies or restricts rights granted under
-applicable third-party licenses.
+5. PRIVATE MODIFICATIONS
 
-8. OWNERSHIP
+Private modifications are permitted only for Educational Use and bona fide
+Non-Commercial Research.
+
+Permission to modify does not include permission to publish, distribute,
+host, sublicense, deploy, commercialize, or provide the modified Software
+to third parties.
+
+
+6. NO IMPLIED RIGHTS
+
+No license or right is granted by implication, estoppel, exhaustion, or
+otherwise.
+
+Possession of a copy of the Software does not grant any right beyond the
+limited permissions expressly stated in this License.
+
+
+7. COPYRIGHT AND OWNERSHIP
 
 The Software is licensed, not sold.
 
-All rights not expressly granted by this license are reserved by the
+Copyright and all other rights in original BitcoinVero materials remain
+with the copyright holder.
+
+All rights not expressly granted under this License are reserved.
+
+
+8. TRADEMARKS AND BRANDING
+
+No trademark, service mark, trade name, logo, domain-name, branding, or
+trade-dress rights are granted under this License.
+
+The BitcoinVero name and branding may not be used to identify another
+project, fork, service, product, distribution, or commercial offering
+without prior written permission.
+
+
+9. THIRD-PARTY MATERIALS
+
+Third-party software, libraries, code, trademarks, datasets, specifications,
+or other materials remain subject to their respective licenses and rights.
+
+Nothing in this License overrides, reduces, expands, or replaces rights or
+obligations applicable to third-party materials.
+
+
+10. NO FINANCIAL OR PROFESSIONAL ADVICE
+
+The Software is provided for technical, educational, and research purposes.
+
+It does not constitute investment, trading, financial, legal, tax,
+accounting, security, or other professional advice.
+
+No output produced by the Software should be treated as a representation,
+warranty, recommendation, or guarantee of financial or technical outcome.
+
+
+11. TERMINATION
+
+Any violation of this License automatically terminates all rights granted
+to you under it without notice.
+
+Upon termination, you must immediately cease all use of the Software and
+delete all copies, modifications, and derivative materials under your
+control, except where retention is required by applicable law.
+
+Termination does not limit any other rights or remedies available to the
 copyright holder.
 
-9. TERMINATION
+Sections concerning ownership, prohibited use, trademarks, disclaimers,
+limitation of liability, and enforcement survive termination.
 
-Any breach of this license automatically terminates the rights granted
-under it.
 
-Upon termination, all use of the Software must cease and all copies
-made under this license must be deleted, except where retention is
-required by applicable law.
+12. NO WARRANTY
 
-10. NO WARRANTY
+THE SOFTWARE IS PROVIDED "AS IS" AND "AS AVAILABLE", WITHOUT WARRANTY OF
+ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO WARRANTIES OF
+MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE, ACCURACY, COMPLETENESS,
+RELIABILITY, AVAILABILITY, SECURITY, NON-INFRINGEMENT, OR CORRECTNESS.
 
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
-EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO WARRANTIES OF
-MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE, ACCURACY,
-RELIABILITY, SECURITY, AND NON-INFRINGEMENT.
+THE SOFTWARE MAY CONTAIN ERRORS AND MAY PRODUCE INCORRECT, INCOMPLETE,
+STALE, OR MISLEADING RESULTS.
 
-11. LIMITATION OF LIABILITY
+USE OF THE SOFTWARE IS ENTIRELY AT YOUR OWN RISK.
 
-TO THE MAXIMUM EXTENT PERMITTED BY LAW, THE COPYRIGHT HOLDER SHALL NOT
-BE LIABLE FOR ANY CLAIM, DAMAGES, LOSS, OR OTHER LIABILITY ARISING FROM
-THE SOFTWARE OR ITS USE.
 
-12. COMMERCIAL LICENSING
+13. LIMITATION OF LIABILITY
 
-Commercial, production, redistribution, integration, hosting, SaaS,
-API, or other uses not permitted by this license may be available under
-a separate written commercial license.
+TO THE MAXIMUM EXTENT PERMITTED BY APPLICABLE LAW, THE COPYRIGHT HOLDER
+SHALL NOT BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL,
+CONSEQUENTIAL, EXEMPLARY, PUNITIVE, OR OTHER DAMAGES, INCLUDING LOSS OF
+DATA, LOSS OF PROFITS, LOSS OF REVENUE, BUSINESS INTERRUPTION, TRADING
+LOSS, FINANCIAL LOSS, OR LOSS ARISING FROM RELIANCE ON THE SOFTWARE OR
+ITS OUTPUTS.
 
-Permission inquiries:
+
+14. COMMERCIAL LICENSING
+
+Commercial use, production use, redistribution, publication of derivative
+works, hosted use, SaaS use, API use, integration, AI/ML use, or other uses
+outside this License may be available under a separate written agreement.
+
+Licensing inquiries:
+
 https://bitcoinvero.com
 
-13. ACCEPTANCE
 
-By using, copying, modifying, or otherwise exercising any rights in the
-Software, you agree to comply with this license.
+15. SEVERABILITY
 
-If you do not agree with these terms, you are not granted permission
-to use the Software.
+If any provision of this License is held invalid, illegal, or unenforceable,
+that provision shall be interpreted or limited to the minimum extent
+necessary, and the remaining provisions shall continue in effect to the
+maximum extent permitted by law.
+
+
+16. NO WAIVER
+
+Failure or delay by the copyright holder to enforce any provision of this
+License does not waive the right to enforce that provision or any other
+provision later.
+
+
+17. ENTIRE LICENSE
+
+This License constitutes the complete license grant for the BitcoinVero
+materials to which it applies.
+
+No oral statement, repository description, README, comment, issue,
+discussion, or other communication expands the rights granted by this
+License unless expressly agreed in writing by the copyright holder.
+
+
+18. GOVERNING LAW
+
+To the extent permitted by applicable law, this License shall be governed
+by the laws of the Russian Federation, without regard to conflict-of-law
+principles.
+
+Nothing in this section limits any mandatory rights, remedies, or
+jurisdiction that cannot lawfully be excluded.
+
+
+19. ACCEPTANCE
+
+By exercising any permission granted under this License, including using,
+copying, running, studying, or modifying the Software, you acknowledge that
+your permission is conditional upon compliance with this License.
+
+If you do not agree to these terms, no permission to use, copy, run,
+modify, distribute, or otherwise exploit the Software is granted.

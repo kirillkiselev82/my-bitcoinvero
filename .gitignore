@@ -59,12 +59,8 @@ pip_freeze_before_*.txt
 
 # Historical/experimental pipeline revisions
 utxo_pipeline_v10_*.py
-utxo_pipeline_v30.py
-utxo_pipeline_v40.py
-utxo_pipeline_v41.py
 utxo_pipeline_v50_r12_7.py
 utxo_pipeline_v50_r12_8.py
-utxo_pipeline_v50_r12_9.py
 
 # Historical auditors
 utxo_pipeline_audit_n*.py
